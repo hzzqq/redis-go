@@ -1,0 +1,9 @@
+# Binaries
+/redis-go
+*.exe
+*.test
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
