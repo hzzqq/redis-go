@@ -79,7 +79,7 @@ func TestExpireCommandSemantics(t *testing.T) {
 	if !s.Expire("k", 100*time.Millisecond) {
 		t.Fatal("expire on existing key should return true")
 	}
-	if !s.Expire("missing", 100*time.Millisecond) {
+	if s.Expire("missing", 100*time.Millisecond) {
 		t.Fatal("expire on missing key should return false")
 	}
 }

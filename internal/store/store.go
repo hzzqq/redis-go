@@ -110,7 +110,7 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 // TTL returns the remaining TTL.
 //   - exists == false : key missing
 //   - rem  < 0        : key exists but has no expiry
-//   - rem  >= 0       : remaining time in seconds
+//   - rem  >= 1       : remaining time in seconds（向上取整，对齐 Redis TTL 语义）
 func (s *Store) TTL(key string) (rem int64, exists bool) {
 	s.mu.RLock()
 	e, ok := s.m[key]
@@ -126,7 +126,8 @@ func (s *Store) TTL(key string) (rem int64, exists bool) {
 		s.Del(key)
 		return 0, false
 	}
-	return int64(left.Seconds()), true
+	// 剩余秒数向上取整（Redis 语义：TTL 对不足 1 秒的剩余时间返回 1）
+	return int64((left + time.Second - 1) / time.Second), true
 }
 
 // Len returns the current number of keys (approximate under concurrency).

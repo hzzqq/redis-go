@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseCommandArray(t *testing.T) {
-	in := "*2\r\n$3\r\nGET\r\n$4\r\nkey\r\n"
+	in := "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n"
 	v, err := NewReader(strings.NewReader(in)).Read()
 	if err != nil {
 		t.Fatal(err)

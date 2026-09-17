@@ -113,7 +113,7 @@ func (rd *Reader) readValue(t Type) (Value, error) {
 			return Value{}, errors.New("resp: invalid array length")
 		}
 		arr := make([]Value, n)
-		for i := 0; i < n; i++ {
+		for i := int64(0); i < n; i++ {
 			b, err := rd.r.ReadByte()
 			if err != nil {
 				return Value{}, err
