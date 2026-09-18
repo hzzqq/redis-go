@@ -33,8 +33,12 @@ import (
 )
 
 // scriptBlocklist 是脚本内禁用的命令：BGREWRITEAOF 自身要拿 applyMu，而
-// 脚本全程持有 applyMu，放行即死锁（Redis 同样禁止脚本内管理命令）。
-var scriptBlocklist = map[string]bool{"BGREWRITEAOF": true}
+// 脚本全程持有 applyMu，放行即死锁；BLPOP 族会阻塞脚本（Redis 同禁：
+// "This Redis command is not allowed from script"）。SORT+STORE 单独在
+// callFunc 拒绝（纯读 SORT 放行）。
+var scriptBlocklist = map[string]bool{
+	"BGREWRITEAOF": true, "BLPOP": true, "BRPOP": true, "BRPOPLPUSH": true,
+}
 
 // oneLine 把错误文本压成单行（RESP 错误行不允许内嵌换行；Lua 编译/运行
 // 错误文本常带换行与 traceback）。
@@ -236,6 +240,11 @@ func (ec *evalCtx) callFunc(isCall bool) func(*lua.LState) int {
 		case scriptBlocklist[name]:
 			reply = resp.Value{Type: resp.Error,
 				Str: "ERR This Redis command is not allowed from script: " + name}
+		case name == "SORT" && sortHasStore(parts[1:]):
+			// STORE 会写库且效果无法从脚本上下文确定性收集（读回时机受限），
+			// 脚本内禁用；纯读 SORT 放行
+			reply = resp.Value{Type: resp.Error,
+				Str: "ERR SORT with STORE is not allowed from script"}
 		case isWriteCmd(v) && ec.s.isReplica():
 			reply = readonlyErr()
 		default:
@@ -244,7 +253,7 @@ func (ec *evalCtx) callFunc(isCall bool) func(*lua.LState) int {
 		}
 		// 成功写命令 → canonical 效果帧（与 AOF/传播同一确定化路径）
 		if isWriteCmd(v) && reply.Type != resp.Error {
-			if c, ok := canonicalWrite(v, reply, setPre); ok {
+			if c, ok := ec.s.canonicalFor(v, reply, setPre); ok {
 				ec.effects = append(ec.effects, c)
 			}
 		}

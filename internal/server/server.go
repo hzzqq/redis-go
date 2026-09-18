@@ -74,6 +74,12 @@ type Server struct {
 	watchMu  sync.Mutex
 	watchers map[string]map[*client]struct{}
 
+	// 阻塞弹出等待者队列（Phase 10）：key → FIFO 等待者。bwMu 保护；锁序
+	// applyMu → bwMu → watchMu。等待者不持 applyMu 睡眠，投喂由推送命令的
+	// applyMu 临界区经 logAndPropagate → serveWaitersFrames 完成。
+	bwMu   sync.Mutex
+	blockQ map[string][]*blockWaiter
+
 	// Lua script cache (Phase 8): sha1 hex → source. scriptMu guards it; the
 	// cache is per-process memory and lost on restart (Redis same).
 	scriptMu sync.Mutex
@@ -90,7 +96,7 @@ func New() *Server {
 	return &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
 		replicas: make(map[*client]*replicaLink), replID: newReplID(),
 		watchers: make(map[string]map[*client]struct{}), backlog: newReplBacklog(),
-		scripts: make(map[string]string)}
+		scripts: make(map[string]string), blockQ: make(map[string][]*blockWaiter)}
 }
 
 // NewWithAOF returns a Server backed by an append-only file at path.
@@ -113,7 +119,7 @@ func NewWithPersist(rdbPath, aofPath string) (*Server, error) {
 	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
 		rdbPath: rdbPath, replicas: make(map[*client]*replicaLink), replID: newReplID(),
 		watchers: make(map[string]map[*client]struct{}), backlog: newReplBacklog(),
-		scripts: make(map[string]string)}
+		scripts: make(map[string]string), blockQ: make(map[string][]*blockWaiter)}
 	if rdbPath != "" && aofPath == "" {
 		entries, err := persist.LoadRDB(rdbPath)
 		if err != nil {
@@ -311,6 +317,12 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 		return s.cmdWatch(cl, v.Arr[1:])
 	case "UNWATCH":
 		return s.cmdUnwatch(cl)
+	case "BLPOP", "BRPOP", "BRPOPLPUSH":
+		// MULTI 内排队、EXEC 时非阻塞执行（Redis 同语义）；连接级走阻塞路径
+		if cl.inMulti {
+			return s.queueForTxn(cl, cmd, v)
+		}
+		return s.blockingPop(cl, cmd, v.Arr[1:])
 	}
 	if cl.inMulti {
 		return s.queueForTxn(cl, cmd, v)
@@ -493,7 +505,10 @@ func (s *Server) dropClient(cl *client) {
 // log/propagate atomically under applyMu (see the Server field comment);
 // reads stay lock-free and concurrent.
 func (s *Server) apply(v resp.Value) resp.Value {
-	if !isWriteCmd(v) {
+	// SORT 带 STORE 是写（覆盖目标 key）；其余 SORT 是读。阻塞弹出由
+	// applyConn 在连接层拦截（阻塞路径不能持 applyMu 睡眠），apply 只会经
+	// MULTI/兜底路径见到它们的 immediate 形态。
+	if !isWriteCmd(v) && !isSortStore(v) {
 		return s.dispatch(v)
 	}
 	// 只读副本拒绝写（Redis 同文 READONLY 错误）；主库命令流（applyFromMaster）
@@ -507,7 +522,7 @@ func (s *Server) apply(v resp.Value) resp.Value {
 	reply := s.dispatch(v)
 	var frames []resp.Value
 	if reply.Type != resp.Error {
-		if canon, ok := canonicalWrite(v, reply, setPre); ok {
+		if canon, ok := s.canonicalFor(v, reply, setPre); ok {
 			frames = append(frames, canon)
 		}
 		// 写命令提交后触碰 WATCH 了这些 key 的连接（乐观锁 CAS 标记）。
@@ -518,6 +533,45 @@ func (s *Server) apply(v resp.Value) resp.Value {
 		return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
 	}
 	return reply
+}
+
+// isSortStore reports whether v is SORT ... STORE dst — a state-mutating
+// command that must go through the write path (applyMu + AOF + propagation).
+func isSortStore(v resp.Value) bool {
+	if v.Type != resp.Array || len(v.Arr) == 0 || !strings.EqualFold(v.Arr[0].Str, "SORT") {
+		return false
+	}
+	for _, a := range v.Arr[1:] {
+		if strings.EqualFold(a.Str, "STORE") {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalFor wraps canonicalWrite with the SORT STORE special case: the
+// stored list is persisted as one RPUSH (or DEL for an empty result) built by
+// reading the just-written key back under the caller's applyMu — the SORT
+// command itself is never replayed (it would re-run its random-free but
+// context-dependent computation; the deterministic frame is the stored list).
+func (s *Server) canonicalFor(v, reply resp.Value, setPre bool) (resp.Value, bool) {
+	if isSortStore(v) {
+		var dst string
+		for i, a := range v.Arr[1:] {
+			if strings.EqualFold(a.Str, "STORE") && i+2 < len(v.Arr) {
+				dst = v.Arr[i+2].Str
+			}
+		}
+		items, err := s.store.ListRange(dst, 0, -1)
+		if err != nil || len(items) == 0 {
+			return respCmd("DEL", dst), true
+		}
+		parts := make([]string, 0, 2+len(items))
+		parts = append(parts, "RPUSH", dst)
+		parts = append(parts, items...)
+		return respCmd(parts...), true
+	}
+	return canonicalWrite(v, reply, setPre)
 }
 
 // isWriteCmd reports whether v dispatches a state-mutating command (the
@@ -539,6 +593,9 @@ var writeCmds = map[string]bool{
 	"APPEND": true, "INCR": true, "DECR": true, "INCRBY": true,
 	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true, "LTRIM": true,
 	"LMOVE": true, "LINSERT": true,
+	// 阻塞弹出：immediate 路径（MULTI/EXEC、apply 兜底）经 canonicalWrite
+	// 确定化为 LPOP/RPOP/LMOVE；连接级阻塞路径在 applyConn 拦截、不经此处。
+	"BLPOP": true, "BRPOP": true, "BRPOPLPUSH": true,
 	"HSET": true, "HDEL": true, "HINCRBY": true,
 	"SADD": true, "SREM": true, "SPOP": true,
 	"ZADD": true, "ZINCRBY": true, "ZREM": true,
@@ -569,6 +626,23 @@ func canonicalWrite(v, reply resp.Value, setPre bool) (resp.Value, bool) {
 	}
 	args := v.Arr[1:]
 	switch cmd {
+	case "BLPOP":
+		// immediate 成功（[key, value] 数组）才落盘；null array = 没弹出
+		if reply.Type == resp.Array && !reply.Null && len(reply.Arr) == 2 {
+			return respCmd("LPOP", args[0].Str), true
+		}
+		return resp.Value{}, false
+	case "BRPOP":
+		if reply.Type == resp.Array && !reply.Null && len(reply.Arr) == 2 {
+			return respCmd("RPOP", args[0].Str), true
+		}
+		return resp.Value{}, false
+	case "BRPOPLPUSH":
+		// 尾弹 src 头推 dst 的确定性形态（阻塞唤醒路径同款）
+		if reply.Type == resp.BulkString && !reply.Null {
+			return respCmd("LMOVE", args[0].Str, args[1].Str, "RIGHT", "LEFT"), true
+		}
+		return resp.Value{}, false
 	case "SPOP":
 		if len(args) < 1 {
 			return v, true
@@ -802,6 +876,16 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdListPop(args, true)
 	case "RPOP":
 		return s.cmdListPop(args, false)
+	case "BLPOP":
+		// dispatch 只做非阻塞形态（MULTI/EXEC 执行、回放兜底）；连接级阻塞
+		// 路径在 applyConn 拦截
+		return s.cmdBlockingImmediate(args, true, "")
+	case "BRPOP":
+		return s.cmdBlockingImmediate(args, false, "")
+	case "BRPOPLPUSH":
+		return s.cmdBlockingImmediate(args, false, "dst")
+	case "SORT":
+		return s.cmdSort(args)
 	case "LLEN":
 		if len(args) != 1 {
 			return wrongArgs("llen")
@@ -1714,8 +1798,12 @@ func (s *Server) infoSections() []infoSection {
 		"rdb_enabled:" + rdbEnabled + "\r\n" +
 		fmt.Sprintf("rdb_last_save_time:%d\r\n", s.lastSave.Load()) +
 		"aof_enabled:" + aofEnabled + "\r\n" +
-		"aof_fsync:" + s.aofFsync + "\r\n" +
-		"\r\n"
+		"aof_fsync:" + s.aofFsync + "\r\n"
+	if s.aof != nil {
+		// everysec 停滞看门狗的主路径兜底同步计数（Phase 10）
+		persistence += fmt.Sprintf("aof_fsync_stalls:%d\r\n", s.aof.Stalls())
+	}
+	persistence += "\r\n"
 	keyspace := "# Keyspace\r\n" +
 		fmt.Sprintf("db0:keys=%d,expires=%d\r\n", keys, expires)
 	return []infoSection{

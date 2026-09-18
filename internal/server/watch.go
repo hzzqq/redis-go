@@ -113,9 +113,9 @@ func writeCmdKeys(name string, args []resp.Value) []string {
 			keys = append(keys, args[i].Str)
 		}
 		return keys
-	case "LMOVE": // 改动源和目标两个 key
-		if len(args) >= 4 {
-			return []string{args[0].Str, args[3].Str}
+	case "LMOVE": // 改动源和目标两个 key（args 不含命令名：src dst dir dir）
+		if len(args) >= 2 {
+			return []string{args[0].Str, args[1].Str}
 		}
 		return nil
 	case "DEL", "MGET":

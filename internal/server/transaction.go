@@ -60,6 +60,8 @@ var cmdArity = map[string][2]int{
 	"SCAN": {1, -1}, "SSCAN": {2, -1}, "HSCAN": {2, -1}, "ZSCAN": {2, -1},
 	"OBJECT": {2, -1},
 	"LMOVE":  {4, 4}, "LINSERT": {4, 4}, "LPOS": {2, -1},
+	// Phase 10
+	"BLPOP": {2, -1}, "BRPOP": {2, -1}, "BRPOPLPUSH": {3, 3}, "SORT": {1, -1},
 }
 
 // resetTxn clears the connection's transaction state.
@@ -130,13 +132,15 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 			scriptEffects = append(scriptEffects, eff...)
 			continue
 		}
-		if s.isReplica() && isWriteCmd(q) {
+		// 副本上阻塞弹出是读（MULTI 内 EXEC 非阻塞执行，Redis 同语义），
+		// 不走 READONLY 门；其余写命令照旧拒绝
+		if s.isReplica() && isWriteCmd(q) && !isBlockingCmd(mustFirstCmd(q)) {
 			r = readonlyErr()
 		} else {
 			pre := s.setPreState(q)
 			r = s.dispatch(q)
 			if isWriteCmd(q) && r.Type != resp.Error {
-				if c, ok := canonicalWrite(q, r, pre); ok {
+				if c, ok := s.canonicalFor(q, r, pre); ok {
 					canon = append(canon, c)
 				}
 			}
@@ -151,6 +155,12 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 	}
 	for _, e := range scriptEffects {
 		s.touchWatched(e, cl)
+	}
+	// 阻塞等待者投喂：本事务的 canonical 帧含 list 推送时，FIFO 投喂并把
+	// 确定性弹出帧并入 MULTI...EXEC 块内（块内原子叙事；logAndPropagate
+	// 的内嵌投喂扫不到已解决的等待者，不会重复）。
+	if c := s.serveWaitersFrames(canon); len(c) > 0 {
+		canon = append(canon, c...)
 	}
 	// AOF 开启时照旧落 MULTI...EXEC 块（全失败的事务也落空块，回放无副作用）；
 	// 纯传播（无 AOF）时仅在确有生效命令时才包块。

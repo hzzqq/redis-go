@@ -8,10 +8,20 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hzzqq/redis-go/internal/resp"
 )
+
+// aofStallAfter is the everysec watchdog threshold: when the background
+// flusher has not completed a successful fsync for this long (goroutine
+// stalled, scheduler starvation), the next Log call on the main path falls
+// back to a synchronous fsync so the page cache cannot grow without bound
+// and the crash-loss window stays capped (Redis's flushAppendOnlyFile does
+// the same on its main thread; the threshold here is a conservative 30s
+// versus Redis's 2×fsync-period, so normal background jitter never trips it).
+const aofStallAfter = 30 * time.Second
 
 // AOF is a concurrency-safe append-only file of RESP-encoded commands, with
 // a pluggable fsync policy (Redis appendfsync):
@@ -30,6 +40,12 @@ type AOF struct {
 	// goroutine, syncDone follows when it has exited (guarded by mu).
 	syncStop chan struct{}
 	syncDone chan struct{}
+
+	// everysec 停滞看门狗：lastSync = 最近一次成功 fsync 的 unixnano（原子，
+	// Log 主路径读、Sync/fsyncNow 写方均持 mu 但计数器本身跨 mu 生命周期）；
+	// syncStalls = 主路径兜底同步次数（INFO aof_fsync_stalls）。
+	lastSync   atomic.Int64
+	syncStalls atomic.Int64
 }
 
 // Open opens path for appending, creating it if needed.
@@ -55,6 +71,9 @@ func (a *AOF) SetFsync(mode string) {
 		if a.syncStop == nil { // not running yet
 			a.syncStop = make(chan struct{})
 			a.syncDone = make(chan struct{})
+			// 刷新看门狗时间戳：lastSync 零值即 1970 年，不初始化会让
+			// 刚切到 everysec 后的首条 Log 误触发兜底同步计数。
+			a.lastSync.Store(time.Now().UnixNano())
 			go a.fsyncLoop(a.syncStop, a.syncDone)
 		}
 		return
@@ -85,28 +104,51 @@ func (a *AOF) fsyncLoop(stop <-chan struct{}, done chan<- struct{}) {
 // fsyncNow syncs the file honoring the current mode; called by Log under mu.
 func (a *AOF) fsyncNow() error {
 	if a.fsyncMode == "always" {
-		return a.f.Sync()
+		err := a.f.Sync()
+		if err == nil {
+			a.lastSync.Store(time.Now().UnixNano())
+		}
+		return err
 	}
 	return nil
 }
 
 // Log appends one command value to the file. With the "always" policy the
-// data is fsynced before Log returns (synchronous durability).
+// data is fsynced before Log returns (synchronous durability). With
+// "everysec" the stall watchdog applies: if the background flusher has not
+// succeeded for aofStallAfter, this call fsyncs synchronously and counts the
+// fallback (visible as INFO aof_fsync_stalls).
 func (a *AOF) Log(v resp.Value) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := resp.WriteValue(a.f, v); err != nil {
 		return err
 	}
+	if a.fsyncMode == "everysec" &&
+		time.Since(time.Unix(0, a.lastSync.Load())) > aofStallAfter {
+		if err := a.f.Sync(); err != nil {
+			return err
+		}
+		a.syncStalls.Add(1)
+		a.lastSync.Store(time.Now().UnixNano())
+	}
 	return a.fsyncNow()
 }
 
-// Sync flushes OS buffers to disk.
+// Sync flushes OS buffers to disk and refreshes the watchdog timestamp.
 func (a *AOF) Sync() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.f.Sync()
+	err := a.f.Sync()
+	if err == nil {
+		a.lastSync.Store(time.Now().UnixNano())
+	}
+	return err
 }
+
+// Stalls reports how many times the everysec watchdog had to fsync on the
+// main path because the background flusher appeared stalled.
+func (a *AOF) Stalls() int64 { return a.syncStalls.Load() }
 
 // Close stops any background flusher and closes the file.
 func (a *AOF) Close() error {

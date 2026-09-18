@@ -494,7 +494,7 @@ func (s *Server) applyFromMaster(v resp.Value) {
 	reply := s.dispatch(v)
 	var frames []resp.Value
 	if reply.Type != resp.Error {
-		if canon, ok := canonicalWrite(v, reply, setPre); ok {
+		if canon, ok := s.canonicalFor(v, reply, setPre); ok {
 			frames = append(frames, canon)
 		}
 	}
@@ -511,7 +511,7 @@ func (s *Server) applyMasterBlock(block []resp.Value) {
 		setPre := s.setPreState(q)
 		reply := s.dispatch(q)
 		if isWriteCmd(q) && reply.Type != resp.Error {
-			if canon, ok := canonicalWrite(q, reply, setPre); ok {
+			if canon, ok := s.canonicalFor(q, reply, setPre); ok {
 				frames = append(frames, canon)
 			}
 		}
@@ -731,7 +731,15 @@ func (s *Server) removeReplica(l *replicaLink) {
 // error is returned to the caller for the reply path (same semantics as
 // before), but propagation continues so replicas stay consistent with the
 // in-memory state (the command did execute locally).
+//
+// 阻塞弹出投喂收口（Phase 10）：本批帧含 list 推送（LPUSH/RPUSH/LMOVE）时，
+// 在同一临界区内按 FIFO 投喂阻塞等待者，其确定性弹出帧（LPOP/RPOP/LMOVE）
+// 追加在本批帧之后一并落盘/传播——AOF 帧序 = 推送帧 + 弹出帧，重放与副本
+// 状态严格一致。所有调用方都持有 applyMu。
 func (s *Server) logAndPropagate(frames []resp.Value) error {
+	if extra := s.serveWaitersFrames(frames); len(extra) > 0 {
+		frames = append(append([]resp.Value{}, frames...), extra...)
+	}
 	var firstErr error
 	for _, f := range frames {
 		if s.aof != nil && firstErr == nil {
