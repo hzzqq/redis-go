@@ -408,4 +408,3 @@ func TestReplicaofSelfRejected(t *testing.T) {
 		t.Fatalf("role after reject: got %v", m)
 	}
 }
-

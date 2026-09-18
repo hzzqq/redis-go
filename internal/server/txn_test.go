@@ -31,6 +31,14 @@ func wantNull(t *testing.T, name string, v resp.Value) {
 	}
 }
 
+// wantNullArray 断言 reply 是 null array（*-1，EXEC 被乐观锁中止的回复）。
+func wantNullArray(t *testing.T, name string, v resp.Value) {
+	t.Helper()
+	if v.Type != resp.Array || !v.Null {
+		t.Fatalf("%s: expected null array, got %#v", name, v)
+	}
+}
+
 // TestTransactionHappyPath MULTI→QUEUED→EXEC：结果合成数组，状态生效，
 // EXEC 后事务状态复位。
 func TestTransactionHappyPath(t *testing.T) {
