@@ -52,6 +52,8 @@ var cmdArity = map[string][2]int{
 	"SAVE": {0, 0}, "BGSAVE": {0, 0},
 	"MULTI": {0, 0}, "EXEC": {0, 0}, "DISCARD": {0, 0},
 	"SUBSCRIBE": {1, -1}, "UNSUBSCRIBE": {0, -1}, "PUBLISH": {2, 2},
+	"REPLICAOF": {2, 2}, "SLAVEOF": {2, 2}, "PSYNC": {2, 2}, "SYNC": {0, 0},
+	"REPLCONF": {2, -1},
 }
 
 // resetTxn clears the connection's transaction state.
@@ -86,8 +88,12 @@ func (s *Server) queueForTxn(cl *client, cmd string, v resp.Value) resp.Value {
 // execTransaction runs the queued commands as one atomic unit: the whole
 // block executes under applyMu so no other client's write command can
 // interleave (same guarantee as single write commands). The AOF receives a
-// MULTI ... EXEC block of canonical forms; failed commands are skipped, the
-// same way apply() skips them. Empty transactions log nothing.
+// MULTI ... EXEC block of canonical forms and the same frames propagate to
+// attached replicas (so downstream replicas replay the block atomically);
+// failed commands are skipped, the same way apply() skips them. Empty
+// transactions log nothing. On a read-only replica, queued write commands
+// surface READONLY errors in their EXEC slots (execution-time errors, like
+// Redis); the remaining commands still run.
 func (s *Server) execTransaction(cl *client) resp.Value {
 	defer cl.resetTxn()
 	if cl.queueErr {
@@ -100,25 +106,30 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	replies := make([]resp.Value, 0, len(cl.queue))
-	var block []resp.Value
-	if s.aof != nil {
-		block = append(block, respCmd("MULTI"))
-	}
+	var canon []resp.Value
 	for _, q := range cl.queue {
-		r := s.dispatch(q)
-		if isWriteCmd(q) && s.aof != nil && r.Type != resp.Error {
-			if canon, ok := canonicalWrite(q, r); ok {
-				block = append(block, canon)
+		var r resp.Value
+		if s.isReplica() && isWriteCmd(q) {
+			r = readonlyErr()
+		} else {
+			r = s.dispatch(q)
+			if isWriteCmd(q) && r.Type != resp.Error {
+				if c, ok := canonicalWrite(q, r); ok {
+					canon = append(canon, c)
+				}
 			}
 		}
 		replies = append(replies, r)
 	}
-	if s.aof != nil {
-		block = append(block, respCmd("EXEC"))
-		for _, v := range block {
-			if err := s.aof.Log(v); err != nil {
-				return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
-			}
+	// AOF 开启时照旧落 MULTI...EXEC 块（全失败的事务也落空块，回放无副作用）；
+	// 纯传播（无 AOF）时仅在确有生效命令时才包块。
+	if s.aof != nil || len(canon) > 0 {
+		frames := make([]resp.Value, 0, len(canon)+2)
+		frames = append(frames, respCmd("MULTI"))
+		frames = append(frames, canon...)
+		frames = append(frames, respCmd("EXEC"))
+		if err := s.logAndPropagate(frames); err != nil {
+			return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
 		}
 	}
 	return resp.Value{Type: resp.Array, Arr: replies}

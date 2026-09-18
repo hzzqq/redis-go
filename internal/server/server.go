@@ -47,11 +47,21 @@ type Server struct {
 	// subMu guards the pub/sub hub below.
 	subMu    sync.Mutex
 	channels map[string]map[*client]struct{} // channel → subscribed conns
+
+	// replication (Phase 7): replID is this server's 40-char run id; master
+	// is non-nil while this instance is a replica; replicas holds the
+	// downstream replica links this server streams commands to. replMu guards
+	// master/replicas; lock order is applyMu → replMu → link.mu.
+	replID   string
+	replMu   sync.Mutex
+	master   *masterLink
+	replicas map[*client]*replicaLink
 }
 
 // New returns a ready-to-serve in-memory Server.
 func New() *Server {
-	return &Server{store: store.New(), channels: make(map[string]map[*client]struct{})}
+	return &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
+		replicas: make(map[*client]*replicaLink), replID: newReplID()}
 }
 
 // NewWithAOF returns a Server backed by an append-only file at path.
@@ -62,13 +72,18 @@ func NewWithAOF(path string) (*Server, error) {
 	return NewWithPersist("", path)
 }
 
-// NewWithPersist loads an RDB snapshot (corrupt RDB is fatal, like Redis)
-// and replays the AOF (tolerating a truncated tail), then opens the AOF for
-// appending. Load order mirrors Redis: RDB first, AOF on top — so with both
-// enabled the AOF state wins.
+// NewWithPersist restores server state from persistence. The AOF is a full,
+// deterministic history: replaying it yields the complete state, and the RDB
+// snapshot point is always inside that history. Loading RDB first and then
+// replaying the whole AOF would apply every pre-snapshot non-idempotent
+// command (RPUSH/LPUSH/INCR/APPEND/...) a second time — observed as duplicated
+// list elements in verification — so when the AOF is enabled it is the sole
+// data source and the RDB is skipped; the RDB loads only without an AOF.
+// Corrupt RDB stays fatal (like Redis); AOF tolerates a truncated tail.
 func NewWithPersist(rdbPath, aofPath string) (*Server, error) {
-	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{}), rdbPath: rdbPath}
-	if rdbPath != "" {
+	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
+		rdbPath: rdbPath, replicas: make(map[*client]*replicaLink), replID: newReplID()}
+	if rdbPath != "" && aofPath == "" {
 		entries, err := persist.LoadRDB(rdbPath)
 		if err != nil {
 			return nil, err
@@ -127,6 +142,7 @@ func (s *Server) Listen(addr string) error {
 // of channels this connection subscribes to and the MULTI/EXEC transaction
 // state (touched only by this connection's handle goroutine).
 type client struct {
+	conn    net.Conn // raw socket (replica-link writer writes frames directly)
 	writeMu sync.Mutex
 	w       *bufio.Writer
 	chans   map[string]struct{}
@@ -134,6 +150,11 @@ type client struct {
 	inMulti  bool         // MULTI received, commands are being queued
 	queue    []resp.Value // commands queued since MULTI
 	queueErr bool         // a queue-time error poisoned the transaction
+
+	// replication-link state (set once by PSYNC, read by handle/dropClient)
+	replPort     string        // announced by REPLCONF listening-port
+	replicaMode  bool          // upgraded to replica: handle() suppresses replies
+	replicaLink  *replicaLink  // this connection's master-side link (nil otherwise)
 }
 
 // write serializes one reply/push onto the connection.
@@ -149,14 +170,18 @@ func (c *client) write(v resp.Value) bool {
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 	r := resp.NewReader(conn)
-	cl := &client{w: bufio.NewWriter(conn), chans: make(map[string]struct{})}
-	defer s.dropClient(cl) // 断连自动退订所有频道
+	cl := &client{conn: conn, w: bufio.NewWriter(conn), chans: make(map[string]struct{})}
+	defer s.dropClient(cl) // 断连自动退订所有频道 + 摘除副本链路
 	for {
 		v, err := r.Read()
 		if err != nil {
 			return
 		}
 		reply := s.applyConn(cl, v)
+		if cl.replicaMode {
+			// 已升级为副本连接：命令流 + REPLCONF ACK 单向，回复一律静默
+			continue
+		}
 		if !cl.write(reply) {
 			return
 		}
@@ -232,11 +257,16 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 	}
 	// 订阅命令需要 per-connection 状态（cl.chans），走连接层而非 dispatch；
 	// PUBLISH 无连接状态，经 apply→dispatch 执行（事务内同样可执行，Redis 同语义）。
+	// REPLCONF/PSYNC 是复制协议命令，连接级处理（PSYNC 把连接升级为副本）。
 	switch cmd {
 	case "SUBSCRIBE":
 		return cl.subscribe(s, v.Arr[1:])
 	case "UNSUBSCRIBE":
 		return cl.unsubscribe(s, v.Arr[1:])
+	case "REPLCONF":
+		return s.handleReplConf(cl, v.Arr[1:])
+	case "PSYNC", "SYNC":
+		return s.handlePSYNC(cl)
 	}
 	return s.apply(v)
 }
@@ -372,8 +402,12 @@ func (s *Server) cmdPublish(args []resp.Value) resp.Value {
 }
 
 // dropClient removes a closing connection from every channel it subscribed
-// to (runs via defer in handle).
+// to, and detaches its replica link if it had been upgraded to one (both run
+// via defer in handle).
 func (s *Server) dropClient(cl *client) {
+	if cl.replicaLink != nil {
+		s.removeReplica(cl.replicaLink)
+	}
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
 	for ch := range cl.chans {
@@ -387,27 +421,34 @@ func (s *Server) dropClient(cl *client) {
 	cl.chans = make(map[string]struct{})
 }
 
-// apply executes v and, when AOF is enabled and the command succeeded,
-// appends the canonical form of the write command to the file before the
-// reply is returned (Redis executes, then propagates, then replies). The
-// reply is passed along because some commands (SPOP) canonicalize to a form
-// derived from what actually happened. Write commands run dispatch and log
-// atomically under applyMu (see the Server field comment); reads stay
-// lock-free and concurrent.
+// apply executes v and, when the command succeeded, propagates the canonical
+// form of the write command to the AOF (if enabled) and to every attached
+// replica before the reply is returned (Redis executes, then propagates, then
+// replies). The canonical form is shared by both sinks: random commands are
+// already determinized (SPOP → SREM) and relative TTLs already absolutized,
+// so replica state and AOF replay agree. Write commands run dispatch and
+// log/propagate atomically under applyMu (see the Server field comment);
+// reads stay lock-free and concurrent.
 func (s *Server) apply(v resp.Value) resp.Value {
 	if !isWriteCmd(v) {
 		return s.dispatch(v)
 	}
+	// 只读副本拒绝写（Redis 同文 READONLY 错误）；主库命令流（applyFromMaster）
+	// 与启动回放不走 apply，因此不受影响。副本仍可 REPLICAOF NO ONE 晋升。
+	if s.isReplica() {
+		return readonlyErr()
+	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	reply := s.dispatch(v)
-	if s.aof == nil || reply.Type == resp.Error {
-		return reply
-	}
-	if canon, ok := canonicalWrite(v, reply); ok {
-		if err := s.aof.Log(canon); err != nil {
-			return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
+	var frames []resp.Value
+	if reply.Type != resp.Error {
+		if canon, ok := canonicalWrite(v, reply); ok {
+			frames = append(frames, canon)
 		}
+	}
+	if err := s.logAndPropagate(frames); err != nil {
+		return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
 	}
 	return reply
 }
@@ -889,6 +930,8 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdZRandMember(args)
 	case "PUBLISH":
 		return s.cmdPublish(args)
+	case "REPLICAOF", "SLAVEOF":
+		return s.cmdReplicaOf(args)
 	case "FLUSHALL":
 		s.store.Flush()
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
@@ -1448,6 +1491,7 @@ func (s *Server) infoSections() []infoSection {
 	return []infoSection{
 		{"Server", server},
 		{"Persistence", persistence},
+		{"Replication", s.replicationSection()},
 		{"Keyspace", keyspace},
 	}
 }

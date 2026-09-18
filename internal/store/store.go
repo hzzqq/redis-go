@@ -412,7 +412,10 @@ func (s *Store) ListPush(key string, front bool, vals ...string) (int64, error) 
 	}
 	if front {
 		grown := make([]string, 0, len(vals)+len(items))
-		grown = append(grown, vals...)
+		// Redis 语义：多参数 LPUSH 依次头插，LPUSH l a b → [b a ...old]
+		for i := len(vals) - 1; i >= 0; i-- {
+			grown = append(grown, vals[i])
+		}
 		grown = append(grown, items...)
 		items = grown
 	} else {

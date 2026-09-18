@@ -23,6 +23,7 @@
 package persist
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc64"
@@ -60,6 +61,23 @@ func SaveRDB(path string, keys []store.Exported) error {
 		return fmt.Errorf("rdb: save: rename: %w", err)
 	}
 	return nil
+}
+
+// EncodeRDB serializes keys into a complete in-memory RDB image (magic +
+// payload + CRC). This is the byte-level form used by master-side full
+// replication: the whole snapshot is sent as one RESP bulk frame.
+func EncodeRDB(keys []store.Exported) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := writeRDB(&buf, keys); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// DecodeRDB parses and validates an in-memory RDB image (CRC checked),
+// returning the records ready for applyExported.
+func DecodeRDB(data []byte) ([]store.Exported, error) {
+	return parseRDB(data)
 }
 
 func writeRDB(w io.Writer, keys []store.Exported) error {
