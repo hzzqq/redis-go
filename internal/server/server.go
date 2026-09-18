@@ -143,12 +143,20 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 		return s.apply(v) // 非法协议形态保持原错误
 	}
 	args := v.Arr[1:]
+	subModeErr := func() resp.Value {
+		return resp.Value{Type: resp.Error, Str: fmt.Sprintf(
+			"ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+			strings.ToLower(cmd))}
+	}
 	switch cmd {
 	case "SUBSCRIBE":
 		return cl.subscribe(s, args)
 	case "UNSUBSCRIBE":
 		return cl.unsubscribe(s, args)
 	case "PUBLISH":
+		if len(cl.chans) > 0 {
+			return subModeErr() // Redis 订阅模式下拒绝 PUBLISH
+		}
 		return s.cmdPublish(args)
 	case "PING":
 		if len(cl.chans) > 0 {
@@ -166,9 +174,7 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 		// 交给 apply 返回 OK，handle 负责断开
 	default:
 		if len(cl.chans) > 0 {
-			return resp.Value{Type: resp.Error, Str: fmt.Sprintf(
-				"ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
-				strings.ToLower(cmd))}
+			return subModeErr()
 		}
 	}
 	return s.apply(v)
@@ -183,14 +189,18 @@ func firstCmd(v resp.Value) (string, bool) {
 }
 
 // subscribe handles SUBSCRIBE channel [channel ...]: registers the client on
-// each channel in the hub and replies with one [subscribe, channel, count]
-// row per channel (count = channels this connection now subscribes to).
-// Resubscribing to a joined channel is a no-op that still replies.
+// each channel in the hub and emits one [subscribe, channel, count] row per
+// channel (count = channels this connection now subscribes to). Redis sends
+// each row as its own RESP frame, so all rows but the last are written
+// directly on the connection (same goroutine → ordering holds) and the last
+// becomes the command reply. Resubscribing to a joined channel is a no-op
+// that still replies.
 func (c *client) subscribe(s *Server, args []resp.Value) resp.Value {
 	if len(args) == 0 {
 		return wrongArgs("subscribe")
 	}
 	s.subMu.Lock()
+	rows := make([]resp.Value, 0, len(args))
 	for _, a := range args {
 		ch := a.Str
 		if _, exists := c.chans[ch]; !exists {
@@ -202,27 +212,30 @@ func (c *client) subscribe(s *Server, args []resp.Value) resp.Value {
 			s.channels[ch] = set
 		}
 		set[c] = struct{}{}
+		// Redis 语义：每行的 count 是“到目前为止”的订阅总数
+		rows = append(rows, subRow("subscribe", ch, int64(len(c.chans))))
 	}
 	s.subMu.Unlock()
-	out := make([]resp.Value, 0, len(args))
-	for _, a := range args {
-		out = append(out, resp.Value{Type: resp.Array, Arr: []resp.Value{
-			{Type: resp.BulkString, Str: "subscribe"},
-			{Type: resp.BulkString, Str: a.Str},
-			{Type: resp.Integer, Num: int64(len(c.chans))},
-		}})
+	for _, row := range rows[:len(rows)-1] {
+		c.write(row)
 	}
-	if len(out) == 1 {
-		return out[0]
-	}
-	return resp.Value{Type: resp.Array, Arr: out}
+	return rows[len(rows)-1]
+}
+
+// subRow builds one [kind, channel, count] confirmation row.
+func subRow(kind, ch string, count int64) resp.Value {
+	return resp.Value{Type: resp.Array, Arr: []resp.Value{
+		{Type: resp.BulkString, Str: kind},
+		{Type: resp.BulkString, Str: ch},
+		{Type: resp.Integer, Num: count},
+	}}
 }
 
 // unsubscribe handles UNSUBSCRIBE [channel ...]: with no arguments it
 // unsubscribes from all channels of this connection. Rows follow the
-// [unsubscribe, channel, count] shape; with nothing subscribed the single
-// row carries a null channel name. Unknown channel names still get a row
-// (with the current count), matching Redis.
+// [unsubscribe, channel, count] shape, one frame per row like Redis; with
+// nothing subscribed the single row carries a null channel name. Unknown
+// channel names still get a row (with the current count), matching Redis.
 func (c *client) unsubscribe(s *Server, args []resp.Value) resp.Value {
 	var targets []string
 	if len(args) == 0 {
@@ -237,8 +250,11 @@ func (c *client) unsubscribe(s *Server, args []resp.Value) resp.Value {
 		}
 	}
 	s.subMu.Lock()
+	rows := make([]resp.Value, 0, len(targets))
 	for _, ch := range targets {
 		if _, was := c.chans[ch]; !was {
+			// 未订阅的频道也要回复一行（count 为当前值），与 Redis 一致
+			rows = append(rows, subRow("unsubscribe", ch, int64(len(c.chans))))
 			continue
 		}
 		delete(c.chans, ch)
@@ -248,27 +264,20 @@ func (c *client) unsubscribe(s *Server, args []resp.Value) resp.Value {
 				delete(s.channels, ch)
 			}
 		}
+		rows = append(rows, subRow("unsubscribe", ch, int64(len(c.chans))))
 	}
 	s.subMu.Unlock()
-	if len(targets) == 0 {
+	if len(rows) == 0 {
 		return resp.Value{Type: resp.Array, Arr: []resp.Value{
 			{Type: resp.BulkString, Str: "unsubscribe"},
 			{Type: resp.BulkString, Null: true},
 			{Type: resp.Integer, Num: 0},
 		}}
 	}
-	out := make([]resp.Value, 0, len(targets))
-	for _, ch := range targets {
-		out = append(out, resp.Value{Type: resp.Array, Arr: []resp.Value{
-			{Type: resp.BulkString, Str: "unsubscribe"},
-			{Type: resp.BulkString, Str: ch},
-			{Type: resp.Integer, Num: int64(len(c.chans))},
-		}})
+	for _, row := range rows[:len(rows)-1] {
+		c.write(row)
 	}
-	if len(out) == 1 {
-		return out[0]
-	}
-	return resp.Value{Type: resp.Array, Arr: out}
+	return rows[len(rows)-1]
 }
 
 // cmdPublish handles PUBLISH channel message: delivers [message, channel,
