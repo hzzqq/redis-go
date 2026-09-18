@@ -103,13 +103,15 @@ func (s *Server) handle(conn net.Conn) {
 
 // apply executes v and, when AOF is enabled and the command succeeded,
 // appends the canonical form of the write command to the file before the
-// reply is returned (Redis executes, then propagates, then replies).
+// reply is returned (Redis executes, then propagates, then replies). The
+// reply is passed along because some commands (SPOP) canonicalize to a form
+// derived from what actually happened.
 func (s *Server) apply(v resp.Value) resp.Value {
 	reply := s.dispatch(v)
 	if s.aof == nil || reply.Type == resp.Error {
 		return reply
 	}
-	if canon, ok := canonicalWrite(v); ok {
+	if canon, ok := canonicalWrite(v, reply); ok {
 		if err := s.aof.Log(canon); err != nil {
 			return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
 		}
@@ -129,7 +131,8 @@ var writeCmds = map[string]bool{
 	"APPEND": true, "INCR": true, "DECR": true, "INCRBY": true,
 	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true, "LTRIM": true,
 	"HSET": true, "HDEL": true, "HINCRBY": true,
-	"SADD": true, "SREM": true,
+	"SADD": true, "SREM": true, "SPOP": true,
+	"ZADD": true, "ZINCRBY": true, "ZREM": true,
 	"FLUSHALL": true,
 }
 
@@ -137,9 +140,12 @@ var writeCmds = map[string]bool{
 // Relative TTLs are rewritten to absolute-millisecond forms so that state is
 // correct after a restart regardless of elapsed time (same approach as Redis
 // AOF propagation): SETEX → SET key val PXAT ms, EXPIRE → PEXPIREAT key ms,
-// SET key val EX/PX n → SET key val PXAT ms. Other write commands are stored
+// SET key val EX/PX n → SET key val PXAT ms. SPOP is rewritten to SREM with
+// the members it actually popped — random commands must not be replayed
+// verbatim or state drifts after a restart. A popped-nothing SPOP (null or
+// empty reply) is not logged at all. Other write commands are stored
 // verbatim. The second return value is false for non-write commands.
-func canonicalWrite(v resp.Value) (resp.Value, bool) {
+func canonicalWrite(v, reply resp.Value) (resp.Value, bool) {
 	if v.Type != resp.Array || len(v.Arr) == 0 {
 		return resp.Value{}, false
 	}
@@ -149,6 +155,25 @@ func canonicalWrite(v resp.Value) (resp.Value, bool) {
 	}
 	args := v.Arr[1:]
 	switch cmd {
+	case "SPOP":
+		if len(args) < 1 {
+			return v, true
+		}
+		switch {
+		case reply.Type == resp.BulkString && reply.Null:
+			return resp.Value{}, false // nothing popped
+		case reply.Type == resp.BulkString:
+			return respCmd("SREM", args[0].Str, reply.Str), true
+		case reply.Type == resp.Array && len(reply.Arr) > 0:
+			parts := make([]string, 0, 2+len(reply.Arr))
+			parts = append(parts, "SREM", args[0].Str)
+			for _, m := range reply.Arr {
+				parts = append(parts, m.Str)
+			}
+			return respCmd(parts...), true
+		default:
+			return resp.Value{}, false // empty array = nothing popped
+		}
 	case "SETEX":
 		if len(args) != 3 {
 			return v, true
@@ -480,6 +505,53 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 			return errReply(err)
 		}
 		return resp.Value{Type: resp.Integer, Num: n}
+	case "SPOP":
+		return s.cmdSetPop(args)
+	case "SRANDMEMBER":
+		return s.cmdSetRandMember(args)
+	case "SINTER":
+		return s.cmdSetAlgebra(args, "sinter")
+	case "SUNION":
+		return s.cmdSetAlgebra(args, "sunion")
+	case "SDIFF":
+		return s.cmdSetAlgebra(args, "sdiff")
+	case "ZADD":
+		return s.cmdZAdd(args)
+	case "ZSCORE":
+		if len(args) != 2 {
+			return wrongArgs("zscore")
+		}
+		score, found, err := s.store.ZScore(args[0].Str, args[1].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		if !found {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: formatScore(score)}
+	case "ZINCRBY":
+		return s.cmdZIncrBy(args)
+	case "ZCARD":
+		if len(args) != 1 {
+			return wrongArgs("zcard")
+		}
+		n, err := s.store.ZCard(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.Integer, Num: n}
+	case "ZRANK":
+		return s.cmdZRank(args, false)
+	case "ZREVRANK":
+		return s.cmdZRank(args, true)
+	case "ZCOUNT":
+		return s.cmdZCount(args)
+	case "ZRANGE":
+		return s.cmdZRange(args, false)
+	case "ZREVRANGE":
+		return s.cmdZRange(args, true)
+	case "ZREM":
+		return s.cmdZRem(args)
 	case "TYPE":
 		if len(args) != 1 {
 			return wrongArgs("type")
@@ -751,6 +823,226 @@ func (s *Server) cmdSetMembers(args []resp.Value, add bool) resp.Value {
 	return resp.Value{Type: resp.Integer, Num: n}
 }
 
+// cmdSetPop handles SPOP key [count]: without count the reply is a single
+// bulk (null when nothing was popped); with count an array (possibly empty).
+func (s *Server) cmdSetPop(args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 2 {
+		return wrongArgs("spop")
+	}
+	withCount := len(args) == 2
+	count := int64(1)
+	if withCount {
+		var err error
+		count, err = strconv.ParseInt(args[1].Str, 10, 64)
+		if err != nil {
+			return notIntegerErr()
+		}
+	}
+	popped, err := s.store.SetPop(args[0].Str, count)
+	if err != nil {
+		return errReply(err)
+	}
+	if !withCount {
+		if len(popped) == 0 {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: popped[0]}
+	}
+	return bulkArray(popped)
+}
+
+// cmdSetRandMember handles SRANDMEMBER key [count]: like SPOP but nothing is
+// removed. Single form replies null for a missing key.
+func (s *Server) cmdSetRandMember(args []resp.Value) resp.Value {
+	if len(args) < 1 || len(args) > 2 {
+		return wrongArgs("srandmember")
+	}
+	withCount := len(args) == 2
+	var count int64
+	if withCount {
+		var err error
+		count, err = strconv.ParseInt(args[1].Str, 10, 64)
+		if err != nil {
+			return notIntegerErr()
+		}
+	}
+	got, err := s.store.SetRandMember(args[0].Str, count, withCount)
+	if err != nil {
+		return errReply(err)
+	}
+	if !withCount {
+		if len(got) == 0 {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: got[0]}
+	}
+	return bulkArray(got)
+}
+
+// cmdSetAlgebra handles SINTER/SUNION/SDIFF key [key ...]: sorted arrays.
+func (s *Server) cmdSetAlgebra(args []resp.Value, name string) resp.Value {
+	if len(args) < 1 {
+		return wrongArgs(name)
+	}
+	keys := fieldsOf(args)
+	var members []string
+	var err error
+	switch name {
+	case "sinter":
+		members, err = s.store.SetInter(keys)
+	case "sunion":
+		members, err = s.store.SetUnion(keys)
+	default:
+		members, err = s.store.SetDiff(keys)
+	}
+	if err != nil {
+		return errReply(err)
+	}
+	return bulkArray(members)
+}
+
+// formatScore renders a score the way Redis replies do: the shortest decimal
+// that round-trips ("1", "2.5", "-0.75").
+func formatScore(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+// cmdZAdd handles ZADD key score member [score member ...] (plain ZADD, no
+// NX/GT/CH flags): replies with the number of newly added members.
+func (s *Server) cmdZAdd(args []resp.Value) resp.Value {
+	if len(args) < 3 || len(args)%2 == 0 {
+		return wrongArgs("zadd")
+	}
+	pairs := make([]store.ZItem, 0, len(args)/2)
+	for i := 1; i < len(args); i += 2 {
+		score, err := strconv.ParseFloat(args[i].Str, 64)
+		if err != nil {
+			return resp.Value{Type: resp.Error, Str: "ERR value is not a valid float"}
+		}
+		pairs = append(pairs, store.ZItem{Member: args[i+1].Str, Score: score})
+	}
+	n, err := s.store.ZAdd(args[0].Str, pairs)
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
+// cmdZIncrBy handles ZINCRBY key increment member: replies with the new score.
+func (s *Server) cmdZIncrBy(args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return wrongArgs("zincrby")
+	}
+	delta, err := strconv.ParseFloat(args[1].Str, 64)
+	if err != nil {
+		return resp.Value{Type: resp.Error, Str: "ERR value is not a valid float"}
+	}
+	v, err := s.store.ZIncrBy(args[0].Str, args[2].Str, delta)
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.BulkString, Str: formatScore(v)}
+}
+
+// cmdZRank handles ZRANK/ZREVRANK key member: 0-based rank as an Integer, or
+// null bulk when the member is absent.
+func (s *Server) cmdZRank(args []resp.Value, rev bool) resp.Value {
+	name := "zrank"
+	if rev {
+		name = "zrevrank"
+	}
+	if len(args) != 2 {
+		return wrongArgs(name)
+	}
+	var rank int64
+	var found bool
+	var err error
+	if rev {
+		rank, found, err = s.store.ZRevRank(args[0].Str, args[1].Str)
+	} else {
+		rank, found, err = s.store.ZRank(args[0].Str, args[1].Str)
+	}
+	if err != nil {
+		return errReply(err)
+	}
+	if !found {
+		return resp.Value{Type: resp.BulkString, Null: true}
+	}
+	return resp.Value{Type: resp.Integer, Num: rank}
+}
+
+// cmdZCount handles ZCOUNT key min max with Redis range syntax
+// ("-inf", "+inf", floats, "(" exclusive prefix).
+func (s *Server) cmdZCount(args []resp.Value) resp.Value {
+	if len(args) != 3 {
+		return wrongArgs("zcount")
+	}
+	minB, err := store.ParseZBound(args[1].Str)
+	if err != nil {
+		return resp.Value{Type: resp.Error, Str: "ERR min or max is not a float"}
+	}
+	maxB, err := store.ParseZBound(args[2].Str)
+	if err != nil {
+		return resp.Value{Type: resp.Error, Str: "ERR min or max is not a float"}
+	}
+	n, err := s.store.ZCount(args[0].Str, minB, maxB)
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
+// cmdZRange handles ZRANGE/ZREVRANGE key start stop [WITHSCORES]: a flat
+// member array, interleaved with score strings when WITHSCORES is given.
+func (s *Server) cmdZRange(args []resp.Value, rev bool) resp.Value {
+	name := "zrange"
+	if rev {
+		name = "zrevrange"
+	}
+	if len(args) < 3 || len(args) > 4 {
+		return wrongArgs(name)
+	}
+	start, ok := parseIntArg(args[1].Str, name)
+	if !ok {
+		return notIntegerErr()
+	}
+	stop, ok := parseIntArg(args[2].Str, name)
+	if !ok {
+		return notIntegerErr()
+	}
+	withScores := false
+	if len(args) == 4 {
+		if !strings.EqualFold(args[3].Str, "WITHSCORES") {
+			return syntaxErr()
+		}
+		withScores = true
+	}
+	items, err := s.store.ZRange(args[0].Str, start, stop, rev)
+	if err != nil {
+		return errReply(err)
+	}
+	out := make([]string, 0, len(items)*2)
+	for _, it := range items {
+		out = append(out, it.Member)
+		if withScores {
+			out = append(out, formatScore(it.Score))
+		}
+	}
+	return bulkArray(out)
+}
+
+// cmdZRem handles ZREM key member [member ...].
+func (s *Server) cmdZRem(args []resp.Value) resp.Value {
+	if len(args) < 2 {
+		return wrongArgs("zrem")
+	}
+	n, err := s.store.ZRem(args[0].Str, fieldsOf(args[1:]))
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
 // infoSection is one block of the INFO reply (header line + fields + blank).
 type infoSection struct {
 	name string
@@ -785,7 +1077,7 @@ func (s *Server) infoSections() []infoSection {
 		aofEnabled = "1"
 	}
 	server := "# Server\r\n" +
-		"redis_version:redis-go-0.3.0\r\n" +
+		"redis_version:redis-go-0.4.0\r\n" +
 		"redis_mode:standalone\r\n" +
 		"os:" + runtime.GOOS + "\r\n" +
 		"go_version:" + runtime.Version() + "\r\n" +

@@ -513,6 +513,182 @@ func TestSetCommands(t *testing.T) {
 	wantErr(t, "SREM too few", s.dispatch(mkCmd("SREM", "k")), "wrong number of arguments")
 }
 
+// wantNullBulk 断言 reply 是 null bulk string。
+func wantNullBulk(t *testing.T, name string, reply resp.Value) {
+	t.Helper()
+	if reply.Type != resp.BulkString || !reply.Null {
+		t.Fatalf("%s: expected null bulk, got type=%c null=%v", name, reply.Type, reply.Null)
+	}
+}
+
+// ---------------- Phase 4: SPOP / SRANDMEMBER / SINTER / SUNION / SDIFF ----------------
+
+func TestSetExtraCommands(t *testing.T) {
+	s := New()
+	s.dispatch(mkCmd("SADD", "a", "x", "y", "z"))
+	s.dispatch(mkCmd("SADD", "b", "y", "z", "w"))
+	// SPOP 单元素形态：bulk、且真的弹出
+	s.dispatch(mkCmd("SADD", "p", "m1", "m2"))
+	reply := s.dispatch(mkCmd("SPOP", "p"))
+	if reply.Type != resp.BulkString || reply.Null {
+		t.Fatalf("SPOP single: expected bulk, got type=%c", reply.Type)
+	}
+	wantInt(t, "SCARD after SPOP", s.dispatch(mkCmd("SCARD", "p")), 1)
+	// SPOP count 形态：数组；count 超过基数 → 全弹并删 key
+	reply = s.dispatch(mkCmd("SPOP", "p", "5"))
+	if reply.Type != resp.Array || len(reply.Arr) != 1 {
+		t.Fatalf("SPOP 5: expected 1-element array, got type=%c len=%d", reply.Type, len(reply.Arr))
+	}
+	wantInt(t, "emptied key deleted", s.dispatch(mkCmd("EXISTS", "p")), 0)
+	// 缺失 key：单形态 null bulk、count 形态空数组
+	wantNullBulk(t, "SPOP missing", s.dispatch(mkCmd("SPOP", "nope")))
+	wantBulkArray(t, "SPOP missing count", s.dispatch(mkCmd("SPOP", "nope", "2")), []string{})
+	// 负数 count
+	wantErr(t, "SPOP negative", s.dispatch(mkCmd("SPOP", "a", "-1")), "must be positive")
+	// SRANDMEMBER：不删除
+	reply = s.dispatch(mkCmd("SRANDMEMBER", "a"))
+	if reply.Type != resp.BulkString || reply.Null {
+		t.Fatalf("SRANDMEMBER single: expected bulk, got type=%c", reply.Type)
+	}
+	wantInt(t, "SRANDMEMBER must not remove", s.dispatch(mkCmd("SCARD", "a")), 3)
+	reply = s.dispatch(mkCmd("SRANDMEMBER", "a", "2"))
+	if reply.Type != resp.Array || len(reply.Arr) != 2 {
+		t.Fatalf("SRANDMEMBER 2: expected 2-element array, got type=%c", reply.Type)
+	}
+	reply = s.dispatch(mkCmd("SRANDMEMBER", "a", "-5"))
+	if reply.Type != resp.Array || len(reply.Arr) != 5 {
+		t.Fatalf("SRANDMEMBER -5: expected 5-element array, got len=%d", len(reply.Arr))
+	}
+	wantNullBulk(t, "SRANDMEMBER missing", s.dispatch(mkCmd("SRANDMEMBER", "nope")))
+	wantBulkArray(t, "SRANDMEMBER missing count", s.dispatch(mkCmd("SRANDMEMBER", "nope", "3")), []string{})
+	// 集合代数：排序输出
+	wantBulkArray(t, "SINTER", s.dispatch(mkCmd("SINTER", "a", "b")), []string{"y", "z"})
+	wantBulkArray(t, "SUNION", s.dispatch(mkCmd("SUNION", "a", "b")), []string{"w", "x", "y", "z"})
+	wantBulkArray(t, "SDIFF", s.dispatch(mkCmd("SDIFF", "a", "b")), []string{"x"})
+	wantBulkArray(t, "SINTER missing", s.dispatch(mkCmd("SINTER", "a", "nope")), []string{})
+	wantBulkArray(t, "SUNION missing", s.dispatch(mkCmd("SUNION", "a", "nope")), []string{"x", "y", "z"})
+	wantBulkArray(t, "SDIFF missing", s.dispatch(mkCmd("SDIFF", "a", "nope")), []string{"x", "y", "z"})
+	s.dispatch(mkCmd("SET", "str2", "v"))
+	wantErr(t, "SINTER wrongtype", s.dispatch(mkCmd("SINTER", "a", "str2")), "WRONGTYPE")
+}
+
+// ---------------- Phase 4: ZSet ----------------
+
+func TestZSetCommands(t *testing.T) {
+	s := New()
+	wantInt(t, "ZADD 3", s.dispatch(mkCmd("ZADD", "z", "1", "a", "2", "b", "3", "c")), 3)
+	wantInt(t, "ZADD update not counted", s.dispatch(mkCmd("ZADD", "z", "9", "a")), 0)
+	// 现在 a=9 b=2 c=3
+	wantBulk(t, "ZSCORE a", s.dispatch(mkCmd("ZSCORE", "z", "a")), "9")
+	wantNullBulk(t, "ZSCORE missing member", s.dispatch(mkCmd("ZSCORE", "z", "zz")))
+	wantNullBulk(t, "ZSCORE missing key", s.dispatch(mkCmd("ZSCORE", "nope", "a")))
+	wantBulk(t, "ZINCRBY", s.dispatch(mkCmd("ZINCRBY", "z", "1.5", "b")), "3.5")
+	wantInt(t, "ZCARD", s.dispatch(mkCmd("ZCARD", "z")), 3)
+	// 排名（升序：b=3.5 在 c=3 之后…… 实际 asc: c(0) b(1) a(2)）
+	wantInt(t, "ZRANK c", s.dispatch(mkCmd("ZRANK", "z", "c")), 0)
+	wantInt(t, "ZRANK a", s.dispatch(mkCmd("ZRANK", "z", "a")), 2)
+	wantInt(t, "ZREVRANK a", s.dispatch(mkCmd("ZREVRANK", "z", "a")), 0)
+	wantInt(t, "ZREVRANK c", s.dispatch(mkCmd("ZREVRANK", "z", "c")), 2)
+	wantNullBulk(t, "ZRANK missing member", s.dispatch(mkCmd("ZRANK", "z", "zz")))
+	// ZCOUNT 边界语法
+	wantInt(t, "ZCOUNT full", s.dispatch(mkCmd("ZCOUNT", "z", "-inf", "+inf")), 3)
+	wantInt(t, "ZCOUNT inclusive", s.dispatch(mkCmd("ZCOUNT", "z", "3", "9")), 3)
+	wantInt(t, "ZCOUNT exclusive", s.dispatch(mkCmd("ZCOUNT", "z", "(3", "9")), 2)
+	// ZRANGE / ZREVRANGE（asc: c b a）
+	wantBulkArray(t, "ZRANGE 0 -1", s.dispatch(mkCmd("ZRANGE", "z", "0", "-1")), []string{"c", "b", "a"})
+	wantBulkArray(t, "ZRANGE 1 2", s.dispatch(mkCmd("ZRANGE", "z", "1", "2")), []string{"b", "a"})
+	wantBulkArray(t, "ZRANGE WITHSCORES",
+		s.dispatch(mkCmd("ZRANGE", "z", "0", "-1", "WITHSCORES")),
+		[]string{"c", "3", "b", "3.5", "a", "9"})
+	wantBulkArray(t, "ZREVRANGE 0 1", s.dispatch(mkCmd("ZREVRANGE", "z", "0", "1")), []string{"a", "b"})
+	wantBulkArray(t, "ZREVRANGE -2 -1 WITHSCORES",
+		s.dispatch(mkCmd("ZREVRANGE", "z", "-2", "-1", "WITHSCORES")),
+		[]string{"b", "3.5", "c", "3"})
+	wantBulkArray(t, "ZRANGE out of range", s.dispatch(mkCmd("ZRANGE", "z", "10", "20")), []string{})
+	// ZREM
+	wantInt(t, "ZREM", s.dispatch(mkCmd("ZREM", "z", "b", "zz")), 1)
+	wantInt(t, "ZCARD after ZREM", s.dispatch(mkCmd("ZCARD", "z")), 2)
+	wantSimple(t, "TYPE zset", s.dispatch(mkCmd("TYPE", "z")), "zset")
+	// 弹空删 key
+	wantInt(t, "ZREM empties", s.dispatch(mkCmd("ZREM", "z", "a", "c")), 2)
+	wantSimple(t, "TYPE after purge", s.dispatch(mkCmd("TYPE", "z")), "none")
+	// WRONGTYPE
+	s.dispatch(mkCmd("SET", "str", "x"))
+	wantErr(t, "ZADD wrongtype", s.dispatch(mkCmd("ZADD", "str", "1", "m")), "WRONGTYPE")
+	wantErr(t, "ZRANGE wrongtype", s.dispatch(mkCmd("ZRANGE", "str", "0", "-1")), "WRONGTYPE")
+	// 参数与解析错误
+	wantErr(t, "ZADD odd args", s.dispatch(mkCmd("ZADD", "z2", "1")), "wrong number of arguments")
+	wantErr(t, "ZADD bad float", s.dispatch(mkCmd("ZADD", "z2", "abc", "m")), "not a valid float")
+	wantErr(t, "ZINCRBY bad float", s.dispatch(mkCmd("ZINCRBY", "z2", "abc", "m")), "not a valid float")
+	wantErr(t, "ZCOUNT bad bound", s.dispatch(mkCmd("ZCOUNT", "z2", "abc", "5")), "min or max is not a float")
+	wantErr(t, "ZRANGE bad option", s.dispatch(mkCmd("ZRANGE", "z2", "0", "1", "BOGUS")), "syntax error")
+	wantErr(t, "ZREM too few", s.dispatch(mkCmd("ZREM", "z2")), "wrong number of arguments")
+}
+
+// TestSPOPAOFRewrite SPOP 是随机命令，落盘必须重写为按实际弹出成员的 SREM；
+// 什么都没弹出的 SPOP 不落盘。回放后状态与原库一致。
+func TestSPOPAOFRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "appendonly.aof")
+	s1, err := NewWithAOF(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.apply(mkCmd("SADD", "s", "a", "b", "c"))
+	// count 形态弹出 2 个
+	reply := s1.apply(mkCmd("SPOP", "s", "2"))
+	if reply.Type != resp.Array || len(reply.Arr) != 2 {
+		t.Fatalf("SPOP 2: expected 2-element array, got type=%c", reply.Type)
+	}
+	popped := map[string]bool{}
+	for _, m := range reply.Arr {
+		popped[m.Str] = true
+	}
+	// 单元素形态弹出剩下的 1 个
+	reply = s1.apply(mkCmd("SPOP", "s"))
+	if reply.Type != resp.BulkString || reply.Null {
+		t.Fatalf("SPOP single: expected bulk, got type=%c", reply.Type)
+	}
+	popped[reply.Str] = true
+	if len(popped) != 3 {
+		t.Fatalf("expected to pop all of {a,b,c}, got %v", popped)
+	}
+	// 未弹出任何东西的 SPOP 不应落盘
+	s1.apply(mkCmd("SPOP", "gone"))
+	s1.apply(mkCmd("SPOP", "gone", "3"))
+	// 弹空后再加一个成员（验证回放顺序）
+	s1.apply(mkCmd("SADD", "s", "keep"))
+	s1.Close()
+
+	cmds, err := persist.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strs := make([]string, len(cmds))
+	for i, v := range cmds {
+		parts := make([]string, len(v.Arr))
+		for j, item := range v.Arr {
+			parts[j] = item.Str
+		}
+		strs[i] = strings.Join(parts, " ")
+	}
+	joined := strings.Join(strs, "\n")
+	if strings.Contains(joined, "SPOP") {
+		t.Fatalf("SPOP must never be logged verbatim, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "SREM s ") {
+		t.Fatalf("SPOP should be rewritten to SREM with popped members, got:\n%s", joined)
+	}
+	// 回放：SADD a b c → SREM 弹出的 → SADD keep → 只剩 keep
+	s2, err := NewWithAOF(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	wantInt(t, "EXISTS s after replay", s2.dispatch(mkCmd("EXISTS", "s")), 1)
+	wantBulkArray(t, "SMEMBERS after replay", s2.dispatch(mkCmd("SMEMBERS", "s")), []string{"keep"})
+}
+
 func TestSetWrongTypeDispatch(t *testing.T) {
 	s := New()
 	s.dispatch(mkCmd("SET", "k", "v"))

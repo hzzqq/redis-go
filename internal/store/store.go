@@ -8,16 +8,18 @@
 //     read paths only report them as missing (the background sweeper
 //     physically removes them within 1s).
 //
-// Value types: a key holds either a string, a list, a hash, or a set.
-// Operating on a key with the wrong command family returns ErrWrongType,
-// mirroring Redis. Empty collections (list/hash/set with no elements left)
-// delete the key, as in Redis. SET always overwrites to a string regardless
-// of the previous type.
+// Value types: a key holds either a string, a list, a hash, a set, or a
+// zset. Operating on a key with the wrong command family returns
+// ErrWrongType, mirroring Redis. Empty collections (list/hash/set with no
+// elements left) delete the key, as in Redis. SET always overwrites to a
+// string regardless of the previous type.
 package store
 
 import (
 	"errors"
 	"math"
+	"math/rand"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -282,7 +284,7 @@ func (s *Store) Len() int {
 }
 
 // Type returns the Redis type name of key: "none", "string", "list", "hash"
-// or "set" (TYPE command).
+// or "set" / "zset" (TYPE command).
 func (s *Store) Type(key string) string {
 	s.mu.RLock()
 	e, ok := validRO(s.m, key)
@@ -299,6 +301,8 @@ func (s *Store) Type(key string) string {
 		return "hash"
 	case *set:
 		return "set"
+	case *zsetVal:
+		return "zset"
 	default:
 		return "none"
 	}
@@ -836,4 +840,183 @@ func (s *Store) SetCard(key string) (int64, error) {
 		return 0, ErrWrongType
 	}
 	return int64(len(st.m)), nil
+}
+
+// SetPop removes and returns up to count uniformly random members. count==0
+// pops nothing; count<0 → ErrPopRange. An emptied set deletes the key.
+func (s *Store) SetPop(key string, count int64) ([]string, error) {
+	if count < 0 {
+		return nil, ErrPopRange
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := validLocked(s.m, key)
+	if !ok {
+		return []string{}, nil
+	}
+	st, isSet := e.val.(*set)
+	if !isSet {
+		return nil, ErrWrongType
+	}
+	if count == 0 || len(st.m) == 0 {
+		return []string{}, nil
+	}
+	members := make([]string, 0, len(st.m))
+	for m := range st.m {
+		members = append(members, m)
+	}
+	rand.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
+	if count > int64(len(members)) {
+		count = int64(len(members))
+	}
+	popped := members[:count]
+	for _, m := range popped {
+		delete(st.m, m)
+	}
+	if len(st.m) == 0 {
+		delete(s.m, key)
+	}
+	return popped, nil
+}
+
+// SetRandMember returns random members WITHOUT removing them. withCount
+// selects the count form: count>0 → up to count DISTINCT members; count<0 →
+// exactly |count| members with repetition allowed (Redis semantics).
+func (s *Store) SetRandMember(key string, count int64, withCount bool) ([]string, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []string{}, nil
+	}
+	st, isSet := e.val.(*set)
+	if !isSet {
+		return nil, ErrWrongType
+	}
+	members := make([]string, 0, len(st.m))
+	for m := range st.m {
+		members = append(members, m)
+	}
+	if !withCount {
+		if len(members) == 0 {
+			return []string{}, nil
+		}
+		return []string{members[rand.Intn(len(members))]}, nil
+	}
+	if count == 0 {
+		return []string{}, nil
+	}
+	if count > 0 {
+		rand.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
+		if count > int64(len(members)) {
+			count = int64(len(members))
+		}
+		return members[:count], nil
+	}
+	// negative: |count| draws with repetition
+	out := make([]string, -count)
+	for i := range out {
+		out[i] = members[rand.Intn(len(members))]
+	}
+	return out, nil
+}
+
+// multiSetView materializes the given keys as sets (missing → nil) under one
+// read-lock pass. Any wrong-type key aborts with ErrWrongType.
+func (s *Store) multiSetView(keys []string) ([]map[string]struct{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	views := make([]map[string]struct{}, len(keys))
+	for i, k := range keys {
+		e, ok := validRO(s.m, k)
+		if !ok {
+			continue
+		}
+		st, isSet := e.val.(*set)
+		if !isSet {
+			return nil, ErrWrongType
+		}
+		views[i] = st.m
+	}
+	return views, nil
+}
+
+// SetInter returns the members present in EVERY key, sorted. Redis makes no
+// ordering guarantee for set algebra results; sorting is our documented
+// choice for deterministic replies.
+func (s *Store) SetInter(keys []string) ([]string, error) {
+	views, err := s.multiSetView(keys)
+	if err != nil {
+		return nil, err
+	}
+	var inter map[string]struct{}
+	for _, v := range views {
+		if v == nil {
+			return []string{}, nil // any missing key → empty intersection
+		}
+		if inter == nil {
+			inter = make(map[string]struct{}, len(v))
+			for m := range v {
+				inter[m] = struct{}{}
+			}
+			continue
+		}
+		for m := range inter {
+			if _, exists := v[m]; !exists {
+				delete(inter, m)
+			}
+		}
+	}
+	out := make([]string, 0, len(inter))
+	for m := range inter {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SetUnion returns the members present in ANY key, sorted.
+func (s *Store) SetUnion(keys []string) ([]string, error) {
+	views, err := s.multiSetView(keys)
+	if err != nil {
+		return nil, err
+	}
+	union := make(map[string]struct{})
+	for _, v := range views {
+		for m := range v {
+			union[m] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(union))
+	for m := range union {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// SetDiff returns the members in the FIRST key that appear in no other key,
+// sorted.
+func (s *Store) SetDiff(keys []string) ([]string, error) {
+	views, err := s.multiSetView(keys)
+	if err != nil {
+		return nil, err
+	}
+	diff := make(map[string]struct{})
+	if views[0] != nil {
+		for m := range views[0] {
+			diff[m] = struct{}{}
+		}
+	}
+	for _, v := range views[1:] {
+		for m := range v {
+			delete(diff, m)
+		}
+	}
+	out := make([]string, 0, len(diff))
+	for m := range diff {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out, nil
 }

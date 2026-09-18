@@ -639,3 +639,140 @@ func TestTypeAndStats(t *testing.T) {
 		t.Fatalf("Stats after expiry: expected 5, got %d", keys)
 	}
 }
+
+// ---------------- Phase 4: Set 补差（SPOP/SRANDMEMBER/SINTER/SUNION/SDIFF） ----------------
+
+func TestSetPop(t *testing.T) {
+	s := New()
+	s.SetAdd("s", []string{"a", "b", "c", "d"})
+	popped, err := s.SetPop("s", 2)
+	if err != nil || len(popped) != 2 {
+		t.Fatalf("SetPop 2: got (%v,%v)", popped, err)
+	}
+	// 弹出的应从集合中消失
+	for _, m := range popped {
+		if ok, _ := s.SetIsMember("s", m); ok {
+			t.Fatalf("member %q should have been popped", m)
+		}
+	}
+	if card, _ := s.SetCard("s"); card != 2 {
+		t.Fatalf("card after pop: got %d", card)
+	}
+	// count 超过基数 → 全弹并删 key
+	popped, err = s.SetPop("s", 99)
+	if err != nil || len(popped) != 2 {
+		t.Fatalf("SetPop overflow: got (%v,%v)", popped, err)
+	}
+	if s.Exists("s") {
+		t.Fatal("emptied set should delete the key")
+	}
+	// count=0 → 空切片；缺失 key → 空切片；负数 → ErrPopRange
+	if popped, _ := s.SetPop("gone", 1); len(popped) != 0 {
+		t.Fatalf("SetPop missing: got %v", popped)
+	}
+	s.SetAdd("s2", []string{"x"})
+	if popped, _ := s.SetPop("s2", 0); len(popped) != 0 {
+		t.Fatalf("SetPop 0: got %v", popped)
+	}
+	if _, err := s.SetPop("s2", -1); err != ErrPopRange {
+		t.Fatalf("SetPop negative: got %v", err)
+	}
+	// wrongtype
+	s.Set("str", "v", 0)
+	if _, err := s.SetPop("str", 1); err != ErrWrongType {
+		t.Fatalf("SetPop wrongtype: got %v", err)
+	}
+}
+
+func TestSetRandMember(t *testing.T) {
+	s := New()
+	s.SetAdd("s", []string{"a", "b", "c"})
+	// 单元素形态：不删除，只随机取一个
+	m, err := s.SetRandMember("s", 0, false)
+	if err != nil || len(m) != 1 {
+		t.Fatalf("SRANDMEMBER single: got (%v,%v)", m, err)
+	}
+	if ok, _ := s.SetIsMember("s", m[0]); !ok {
+		t.Fatalf("SRANDMEMBER must not remove %q", m[0])
+	}
+	if card, _ := s.SetCard("s"); card != 3 {
+		t.Fatalf("SRANDMEMBER must not modify set, card=%d", card)
+	}
+	// 正数 count：去重、≤count
+	for i := 0; i < 20; i++ {
+		got, _ := s.SetRandMember("s", 5, true)
+		if len(got) != 3 { // count > 基数 → 全集
+			t.Fatalf("count>card: expected all 3, got %v", got)
+		}
+		seen := map[string]bool{}
+		for _, g := range got {
+			if seen[g] {
+				t.Fatalf("positive count must be distinct: %v", got)
+			}
+			seen[g] = true
+		}
+	}
+	got, _ := s.SetRandMember("s", 2, true)
+	if len(got) != 2 {
+		t.Fatalf("count=2: got %v", got)
+	}
+	// 负数 count：恰好 |count| 个、可重复
+	got, _ = s.SetRandMember("s", -7, true)
+	if len(got) != 7 {
+		t.Fatalf("count=-7: expected 7, got %v", got)
+	}
+	for _, g := range got {
+		if ok, _ := s.SetIsMember("s", g); !ok {
+			t.Fatalf("drawn member %q not in set", g)
+		}
+	}
+	// 缺失 key → 空数组（单元素与 count 形态）
+	if got, _ := s.SetRandMember("nope", 0, false); len(got) != 0 {
+		t.Fatalf("single on missing: got %v", got)
+	}
+	if got, _ := s.SetRandMember("nope", 3, true); len(got) != 0 {
+		t.Fatalf("count on missing: got %v", got)
+	}
+}
+
+func TestSetInterUnionDiff(t *testing.T) {
+	s := New()
+	s.SetAdd("a", []string{"x", "y", "z"})
+	s.SetAdd("b", []string{"y", "z", "w"})
+	s.SetAdd("c", []string{"z"})
+	eq := func(name string, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s: got %v want %v", name, got, want)
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%s: got %v want %v", name, got, want)
+			}
+		}
+	}
+	got, _ := s.SetInter([]string{"a", "b", "c"})
+	eq("SINTER", got, []string{"z"})
+	got, _ = s.SetUnion([]string{"a", "b"})
+	eq("SUNION", got, []string{"w", "x", "y", "z"})
+	got, _ = s.SetDiff([]string{"a", "b", "c"})
+	eq("SDIFF", got, []string{"x"})
+	// 任一 key 缺失：SINTER 为空、SUNION/SDIFF 正常
+	got, _ = s.SetInter([]string{"a", "missing"})
+	eq("SINTER missing", got, []string{})
+	got, _ = s.SetUnion([]string{"a", "missing"})
+	eq("SUNION missing", got, []string{"x", "y", "z"})
+	got, _ = s.SetDiff([]string{"a", "missing"})
+	eq("SDIFF missing", got, []string{"x", "y", "z"})
+	// wrongtype 中断
+	s.Set("str", "v", 0)
+	if _, err := s.SetInter([]string{"a", "str"}); err != ErrWrongType {
+		t.Fatalf("SINTER wrongtype: got %v", err)
+	}
+	if _, err := s.SetUnion([]string{"str"}); err != ErrWrongType {
+		t.Fatalf("SUNION wrongtype: got %v", err)
+	}
+	if _, err := s.SetDiff([]string{"a", "str"}); err != ErrWrongType {
+		t.Fatalf("SDIFF wrongtype: got %v", err)
+	}
+}
