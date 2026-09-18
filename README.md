@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 7）
+# redis-go · Go 复刻 Redis（Phase 8）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -56,10 +56,17 @@
 - **回归修复（冒烟驱动）**：① `handlePSYNC` 只注册 `s.replicas[cl]` 漏设 `cl.replicaLink`，导致副本断开后主库永不摘除链路（`dropClient` 依赖该字段）——补一行赋值并加回归测试；② `store.ListPush` 多参数头插顺序与 Redis 不符（`LPUSH l a b` 应得 `[b,a]` 而非 `[a,b]`）——改为逆序 append 并补 store/server 两层用例；③ `replicationSection` 对级联中间节点只走 replica 分支丢了 `connected_slaves`——重构为两段都输出。
 - **运维命令**：`REPLCONF`/`PSYNC`/`SYNC`（连接级处理）、`-replicaof host:port` 启动参数、`INFO replication`（role/master_host/master_port/master_link_status/connected_slaves/slaveN/master_replid）。
 
+### Phase 8 — WATCH 乐观锁 + 部分重同步 + Lua 脚本（本提交）
+- **WATCH/UNWATCH 事务乐观锁**：hub 模式（`watchers map[key]map[*client]`，锁序 applyMu→watchMu）——写命令（含 EVAL 脚本效果）执行成功后 `touchWatched` 按命令 key 把关注连接打 dirty；EXEC 时 dirty 即放弃整个队列回 **null array `*-1`**（Redis 同款；TCP 冒烟暴露原实现回 `$-1`，已修 resp 编码器区分 null array/bulk）。UNWATCH/EXEC/DISCARD/QUIT/断连清 watch；MULTI 内 WATCH 直接报错（Redis 同文）。
+- **部分重同步（repl-backlog + PSYNC offset + REPLCONF ACK）**：主库维护 **1 MiB 环形 backlog**（feed 在 applyMu 临界区，与命令提交同一原子区间）；副本断线重连发 `PSYNC <replid> <offset>`——replid 匹配且 offset 仍在 backlog → `+CONTINUE` 只续传增量帧（不 Flush、不重写 AOF 基线），否则退化全量。offset 按**帧重编码长度**计量（与 propagate 同一编码器，不受 bufio 4KB 预读影响）；流循环**复用握手同一个 resp.Reader**——新建 Reader 会丢掉旧 bufio 已预读的字节，曾致 CONTINUE 增量整段丢失（回归测试暴露）。主库每秒 `REPLCONF GETACK` 心跳收集副本 ack，`INFO replication` 输出 `slaveN ... offset=` 与 `master_repl_offset`。`REPLICAOF NO ONE` 晋升时保留上游 replid/offset，重挂**同一主库**自动走部分重同步、异主库退化全量（对齐真实 Redis replid 保留语义）。
+- **Lua 脚本（EVAL/EVALSHA/SCRIPT）**：gopher-lua（纯 Go Lua 5.1）——`redis.call/pcall/status_reply/error_reply` + KEYS/ARGV 表注入。**效果复制**：脚本内写命令经 canonicalWrite 确定化（SPOP→SREM、相对 TTL→PXAT）落 AOF + 传播副本，**脚本本身不落盘不原样传播**（重启/副本重放状态严格一致，实测）；全程持 applyMu 保证原子；**无回滚**（脚本报错时先前效果照常生效并传播，对齐 Redis——不传播会分叉）；副本上脚本可读、写调用回 READONLY 中止；事务内 EVAL 效果并入 MULTI...EXEC 块；`SCRIPT LOAD/EXISTS/FLUSH` + `EVALSHA`（未命中回 NOSCRIPT，sha 缓存进程内、重启丢失，Redis 同）；脚本内禁 BGREWRITEAOF（applyMu 重入死锁）。Lua↔RESP 转换矩阵（nil/false→null bulk、true→整数 1、`{ok=}`/`{err=}`→状态/错误），错误文本单行净化（RESP 错误行禁内嵌换行）。
+- **基线扩展（cmd/bench，Windows 本机）**：`-cmd` 新增 `EVAL`/`EVALSHA`/`CAS`（WATCH→MULTI→SET→EXEC，4 次往返/op）。SET 188.8k ops/s（c=50 p=1）；GET **474.4k ops/s**（pipeline 16）；EVAL 8.0k / EVALSHA 7.5k ops/s（c=20，LState 每次新建是瓶颈，语义正确优先不做池化）；CAS 19.9k ops/s（c=10）。
+- **工程**：go.mod 升 **go 1.23**（gopher-lua v1.1.0 要求）；新增 eval_test.go 8 用例 + psync_test.go 4 用例（backlog 环形语义 / 全量→部分→回退三路径 / ACK 收敛）。
+
 ## 与 redis-cli 联调
 
 ```bash
-# 需要 Go 1.22+
+# 需要 Go 1.23+
 go build -o redis-go .
 ./redis-go -addr :6379 &                    # 纯内存模式
 ./redis-go -addr :6379 -aof appendonly.aof  # AOF 持久化模式
@@ -112,6 +119,19 @@ redis-cli -p 6381 get k                 # "v" —— 命令流实时到达副本
 redis-cli -p 6381 set x y               # READONLY ...（副本拒写）
 redis-cli -p 6381 replicaof no one      # OK —— 晋升为主库，恢复可写
 # 杀掉副本重启（同参数）→ 自动重连 + 全量重同步；杀掉主库重启 → 副本 2s 退避重连
+redis-cli -p 6381 replicaof 127.0.0.1 6380
+# 短暂断线后重挂同一主库 → +CONTINUE 部分重同步，只补断线期间的增量（主库日志 "partial resync, resumed"）
+
+# ── WATCH 乐观锁 + Lua 脚本（Phase 8）──
+redis-cli watch k                    # OK
+# 另一终端：redis-cli set k other     # 之后 multi → set k v → exec 回 (nil)（乐观锁中止，一条不执行）
+redis-cli multi                      # set k v → QUEUED → exec → (nil)
+redis-cli unwatch                    # OK，重新 WATCH 后无干扰则正常提交
+redis-cli eval "return redis.call('SET', KEYS[1], ARGV[1])" 1 gk gv
+                                     # "OK"；AOF/副本收到的是 SET gk gv（效果复制，脚本不落盘）
+redis-cli eval "return {KEYS[1], ARGV[1]}" 1 a b    # 1) "a"  2) "b"
+redis-cli script load "return ARGV[1]"              # 40 位 sha
+redis-cli evalsha <sha> 0 hello      # "hello"；未登记的 sha 回 NOSCRIPT 错误
 ```
 
 重启后数据仍在（AOF 模式）：`foo`、列表、哈希全部回放，TTL 按真实流逝时间继续衰减。
@@ -139,14 +159,17 @@ redis-cli ──TCP──▶ server.Listen
 
 **并发模型**：写锁内原地变更，读锁内拷贝一切逃逸数据（string 天然不可变，slice/map 显式拷贝）；过期 key 写路径懒删除、读路径视作缺失（1s 周期清扫兜底物理删除）。
 
-**复制模型**：写命令在 `applyMu` 临界区内「执行 → canonical 化 → AOF 落盘 + 副本入队」一步完成；每条副本连接一个独立 writer goroutine 出站（队列积压超 256MB 断开）；副本端独立连接回放命令流（READONLY 门拦截本端写），断线 2s 退避重连即全量重同步。锁序：`applyMu → replMu → link.mu`。
+**复制模型**：写命令在 `applyMu` 临界区内「执行 → canonical 化 → AOF 落盘 + 副本入队 + repl-backlog feed」一步完成；每条副本连接一个独立 writer goroutine 出站（队列积压超 256MB 断开）；副本断线重连先试 `PSYNC <replid> <offset>` 部分重同步（1 MiB 环形 backlog 续传增量，超出范围退化全量 RDB）；主库每秒 REPLCONF GETACK 收集副本进度（INFO 可观测）。锁序：`applyMu → replMu → link.mu`。
 
-## 下一步（Phase 8）
+## 下一步（Phase 9）
 
 - [x] 主从复制（全量 RDB 同步 + 命令流传播、级联、REPLICAOF/READONLY/INFO replication）
-- [ ] WATCH/UNWATCH（事务乐观锁，可选）
-- [ ] 部分重同步（repl-backlog + PSYNC offset）与主从心跳 REPLCONF ACK
-- [ ] redis-benchmark 对照基线 / Lua 脚本（EVAL）
+- [x] WATCH/UNWATCH 乐观锁、部分重同步（repl-backlog + PSYNC CONTINUE + REPLCONF ACK）、Lua 脚本（EVAL/EVALSHA/SCRIPT）
+- [ ] SCAN/SSCAN/HSCAN/ZSCAN 游标遍历
+- [ ] List 补全：LMOVE / LINSERT / LPOS
+- [ ] appendfsync everysec（后台 fsync + 崩溃丢失窗口语义）
+- [ ] EXPIRE NX/XX/GT/LT 选项、SET 选项矩阵收尾、OBJECT ENCODING
+- [ ] redis-benchmark 与真实 Redis 同机对照表
 
 ## 测试与验收
 
@@ -160,3 +183,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-18：Phase 5（`75211cd`+`c247c8d`+`c974934`）AOF 重写 + pub/sub + 压测基线；全量测试 3 轮通过 + 25/25 TCP 冒烟（重写压缩 468→255B、重启回放一致、pub/sub 不落盘、二次重启 DBSIZE=8）。
 - 2026-09-18：Phase 6（`9892632`+`292accc`）MULTI/EXEC 事务 + RDB 快照 + ZRANGEBYSCORE 族 + MGET/MSET/ZRANDMEMBER；全量测试 3 轮通过 + 34/34 TCP 冒烟（EXECABORT 不执行、RDB 重启回放含 TTL、CRC 损坏拒启、事务 AOF 块重启一致）。
 - 2026-09-18：Phase 7 主从复制：全量测试 3 轮通过（新增 replication_test.go 7 用例 + rdb 字节级 round-trip）+ 32/32 双实例 TCP 冒烟（五类型 + TTL 传播、事务块传播、SPOP 确定化、杀副本重启重同步、杀主库重启重连、REPLICAOF NO ONE 晋升）；冒烟另暴露并修复 3 处回归（见 Phase 7 章节）。
+- 2026-09-18：Phase 8 WATCH 乐观锁 + 部分重同步（repl-backlog/PSYNC CONTINUE/REPLCONF ACK）+ Lua 脚本（EVAL/EVALSHA/SCRIPT 效果复制）+ bench 扩展（EVAL/EVALSHA/CAS）：全量测试 3 轮通过（新增 eval_test.go 8 用例 + psync_test.go 4 用例）+ 双实例 TCP 冒烟（五类型 + TTL 传播、EVAL 效果传播与重启恢复、WATCH 中止/UNWATCH 恢复、SCRIPT 族、部分重同步主/副日志断言、副本重启走全量、ACK offset 收敛）；冒烟另暴露 EXEC 乐观锁中止回复应为 `*-1` null array（原为 `$-1`，已修 resp 编码器并更新回归测试）。
