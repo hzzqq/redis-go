@@ -1,15 +1,17 @@
-// Package server implements a Redis-compatible TCP server (Phase 1).
+// Package server implements a Redis-compatible TCP server.
 package server
 
 import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hzzqq/redis-go/internal/persist"
 	"github.com/hzzqq/redis-go/internal/resp"
 	"github.com/hzzqq/redis-go/internal/store"
 )
@@ -17,11 +19,41 @@ import (
 // Server holds the in-memory store and dispatches commands.
 type Server struct {
 	store *store.Store
+	aof   *persist.AOF // nil = persistence disabled
 }
 
-// New returns a ready-to-serve Server.
+// New returns a ready-to-serve in-memory Server.
 func New() *Server {
 	return &Server{store: store.New()}
+}
+
+// NewWithAOF returns a Server backed by an append-only file at path.
+// Any existing file is replayed first (a truncated tail is tolerated:
+// commands parsed before the truncation point are applied), then the file is
+// reopened for appending.
+func NewWithAOF(path string) (*Server, error) {
+	cmds, err := persist.Load(path)
+	if err != nil {
+		log.Printf("warning: %v", err)
+	}
+	s := &Server{store: store.New()}
+	for _, v := range cmds {
+		s.dispatch(v)
+	}
+	a, err := persist.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	s.aof = a
+	return s, nil
+}
+
+// Close releases the AOF file handle, if any.
+func (s *Server) Close() error {
+	if s.aof == nil {
+		return nil
+	}
+	return s.aof.Close()
 }
 
 // Listen accepts connections on addr (e.g. ":6379") until an error occurs.
@@ -52,7 +84,7 @@ func (s *Server) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
-		reply := s.dispatch(v)
+		reply := s.apply(v)
 		if err := resp.WriteValue(w, reply); err != nil {
 			return
 		}
@@ -65,9 +97,109 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
+// apply executes v and, when AOF is enabled and the command succeeded,
+// appends the canonical form of the write command to the file before the
+// reply is returned (Redis executes, then propagates, then replies).
+func (s *Server) apply(v resp.Value) resp.Value {
+	reply := s.dispatch(v)
+	if s.aof == nil || reply.Type == resp.Error {
+		return reply
+	}
+	if canon, ok := canonicalWrite(v); ok {
+		if err := s.aof.Log(canon); err != nil {
+			return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
+		}
+	}
+	return reply
+}
+
 func isQuit(v resp.Value) bool {
 	return v.Type == resp.Array && len(v.Arr) > 0 &&
 		strings.EqualFold(v.Arr[0].Str, "QUIT")
+}
+
+// writeCmds is the set of commands that mutate state and therefore get
+// logged to the AOF.
+var writeCmds = map[string]bool{
+	"SET": true, "SETEX": true, "DEL": true, "EXPIRE": true, "PEXPIREAT": true,
+	"APPEND": true, "INCR": true, "DECR": true, "INCRBY": true,
+	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true, "LTRIM": true,
+	"HSET": true, "HDEL": true, "HINCRBY": true,
+	"FLUSHALL": true,
+}
+
+// canonicalWrite maps a successful write command to its persisted form.
+// Relative TTLs are rewritten to absolute-millisecond forms so that state is
+// correct after a restart regardless of elapsed time (same approach as Redis
+// AOF propagation): SETEX → SET key val PXAT ms, EXPIRE → PEXPIREAT key ms,
+// SET key val EX/PX n → SET key val PXAT ms. Other write commands are stored
+// verbatim. The second return value is false for non-write commands.
+func canonicalWrite(v resp.Value) (resp.Value, bool) {
+	if v.Type != resp.Array || len(v.Arr) == 0 {
+		return resp.Value{}, false
+	}
+	cmd := strings.ToUpper(v.Arr[0].Str)
+	if !writeCmds[cmd] {
+		return resp.Value{}, false
+	}
+	args := v.Arr[1:]
+	switch cmd {
+	case "SETEX":
+		if len(args) != 3 {
+			return v, true
+		}
+		sec, err := strconv.ParseInt(args[1].Str, 10, 64)
+		if err != nil || sec <= 0 {
+			return v, true
+		}
+		return respCmd("SET", args[0].Str, args[2].Str,
+			"PXAT", msAt(time.Now().Add(time.Duration(sec)*time.Second))), true
+	case "EXPIRE":
+		if len(args) != 2 {
+			return v, true
+		}
+		sec, err := strconv.ParseInt(args[1].Str, 10, 64)
+		if err != nil {
+			return v, true
+		}
+		return respCmd("PEXPIREAT", args[0].Str,
+			msAt(time.Now().Add(time.Duration(sec)*time.Second))), true
+	case "SET":
+		out := make([]resp.Value, len(v.Arr))
+		out[0] = resp.Value{Type: resp.BulkString, Str: "SET"}
+		copy(out[1:], args)
+		for i := 1; i < len(out)-1; i++ {
+			opt := strings.ToUpper(out[i].Str)
+			if opt != "EX" && opt != "PX" {
+				continue
+			}
+			n, err := strconv.ParseInt(out[i+1].Str, 10, 64)
+			if err != nil || n <= 0 {
+				return v, true // replay would fail identically; keep verbatim
+			}
+			unit := time.Second
+			if opt == "PX" {
+				unit = time.Millisecond
+			}
+			out[i] = resp.Value{Type: resp.BulkString, Str: "PXAT"}
+			out[i+1] = resp.Value{Type: resp.BulkString, Str: msAt(time.Now().Add(time.Duration(n) * unit))}
+			break
+		}
+		return resp.Value{Type: resp.Array, Arr: out}, true
+	default:
+		return v, true
+	}
+}
+
+func msAt(t time.Time) string { return strconv.FormatInt(t.UnixMilli(), 10) }
+
+// respCmd builds an array-of-bulk-strings RESP value from plain strings.
+func respCmd(parts ...string) resp.Value {
+	arr := make([]resp.Value, len(parts))
+	for i, p := range parts {
+		arr[i] = resp.Value{Type: resp.BulkString, Str: p}
+	}
+	return resp.Value{Type: resp.Array, Arr: arr}
 }
 
 func (s *Server) dispatch(v resp.Value) resp.Value {
@@ -91,7 +223,10 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		if len(args) != 1 {
 			return wrongArgs("get")
 		}
-		val, ok := s.store.Get(args[0].Str)
+		val, ok, err := s.store.Get(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
 		if !ok {
 			return resp.Value{Type: resp.BulkString, Null: true}
 		}
@@ -118,6 +253,8 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return resp.Value{Type: resp.Integer, Num: n}
 	case "EXPIRE":
 		return s.cmdExpire(args)
+	case "PEXPIREAT":
+		return s.cmdPExpireAt(args)
 	case "TTL":
 		if len(args) != 1 {
 			return wrongArgs("ttl")
@@ -138,8 +275,174 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdIncrBy(args, -1, "decr")
 	case "INCRBY":
 		return s.cmdIncrByWithAmount(args, "incrby")
+	case "LPUSH":
+		return s.cmdListPush(args, true)
+	case "RPUSH":
+		return s.cmdListPush(args, false)
+	case "LPOP":
+		return s.cmdListPop(args, true)
+	case "RPOP":
+		return s.cmdListPop(args, false)
+	case "LLEN":
+		if len(args) != 1 {
+			return wrongArgs("llen")
+		}
+		n, err := s.store.ListLen(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.Integer, Num: n}
+	case "LRANGE":
+		if len(args) != 3 {
+			return wrongArgs("lrange")
+		}
+		start, ok := parseIntArg(args[1].Str, "lrange")
+		if !ok {
+			return notIntegerErr()
+		}
+		stop, ok := parseIntArg(args[2].Str, "lrange")
+		if !ok {
+			return notIntegerErr()
+		}
+		items, err := s.store.ListRange(args[0].Str, start, stop)
+		if err != nil {
+			return errReply(err)
+		}
+		return bulkArray(items)
+	case "LINDEX":
+		if len(args) != 2 {
+			return wrongArgs("lindex")
+		}
+		idx, ok := parseIntArg(args[1].Str, "lindex")
+		if !ok {
+			return notIntegerErr()
+		}
+		val, found, err := s.store.ListIndex(args[0].Str, idx)
+		if err != nil {
+			return errReply(err)
+		}
+		if !found {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: val}
+	case "LSET":
+		if len(args) != 3 {
+			return wrongArgs("lset")
+		}
+		idx, ok := parseIntArg(args[1].Str, "lset")
+		if !ok {
+			return notIntegerErr()
+		}
+		if err := s.store.ListSet(args[0].Str, idx, args[2].Str); err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.SimpleString, Str: "OK"}
+	case "LTRIM":
+		if len(args) != 3 {
+			return wrongArgs("ltrim")
+		}
+		start, ok := parseIntArg(args[1].Str, "ltrim")
+		if !ok {
+			return notIntegerErr()
+		}
+		stop, ok := parseIntArg(args[2].Str, "ltrim")
+		if !ok {
+			return notIntegerErr()
+		}
+		if err := s.store.ListTrim(args[0].Str, start, stop); err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.SimpleString, Str: "OK"}
+	case "HSET":
+		return s.cmdHSet(args)
+	case "HGET":
+		if len(args) != 2 {
+			return wrongArgs("hget")
+		}
+		val, ok, err := s.store.HashGet(args[0].Str, args[1].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		if !ok {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: val}
+	case "HGETALL":
+		if len(args) != 1 {
+			return wrongArgs("hgetall")
+		}
+		pairs, err := s.store.HashGetAll(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		items := make([]string, 0, len(pairs)*2)
+		for _, p := range pairs {
+			items = append(items, p[0], p[1])
+		}
+		return bulkArray(items)
+	case "HDEL":
+		if len(args) < 2 {
+			return wrongArgs("hdel")
+		}
+		n, err := s.store.HashDel(args[0].Str, fieldsOf(args[1:]))
+		if err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.Integer, Num: n}
+	case "HLEN":
+		if len(args) != 1 {
+			return wrongArgs("hlen")
+		}
+		n, err := s.store.HashLen(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.Integer, Num: n}
+	case "HEXISTS":
+		if len(args) != 2 {
+			return wrongArgs("hexists")
+		}
+		exists, err := s.store.HashExists(args[0].Str, args[1].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		if exists {
+			return resp.Value{Type: resp.Integer, Num: 1}
+		}
+		return resp.Value{Type: resp.Integer, Num: 0}
+	case "HKEYS":
+		if len(args) != 1 {
+			return wrongArgs("hkeys")
+		}
+		keys, err := s.store.HashKeys(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return bulkArray(keys)
+	case "HVALS":
+		if len(args) != 1 {
+			return wrongArgs("hvals")
+		}
+		vals, err := s.store.HashVals(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return bulkArray(vals)
+	case "HINCRBY":
+		if len(args) != 3 {
+			return wrongArgs("hincrby")
+		}
+		delta, ok := parseIntArg(args[2].Str, "hincrby")
+		if !ok {
+			return notIntegerErr()
+		}
+		n, err := s.store.HashIncrBy(args[0].Str, args[1].Str, delta)
+		if err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.Integer, Num: n}
 	case "FLUSHALL":
-		s.store = store.New()
+		s.store.Flush()
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
 	case "COMMAND":
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
@@ -155,24 +458,36 @@ func (s *Server) cmdSet(args []resp.Value) resp.Value {
 		return wrongArgs("set")
 	}
 	key, val := args[0].Str, args[1].Str
-	ttl := time.Duration(0)
+	var exp time.Time // zero = no expiry
 	for i := 2; i < len(args); i++ {
 		switch strings.ToUpper(args[i].Str) {
-		case "EX":
+		case "EX", "PX", "PXAT":
 			if i+1 >= len(args) {
 				return syntaxErr()
 			}
-			sec, err := strconv.ParseInt(args[i+1].Str, 10, 64)
-			if err != nil || sec <= 0 {
+			n, err := strconv.ParseInt(args[i+1].Str, 10, 64)
+			if err != nil {
 				return resp.Value{Type: resp.Error, Str: "ERR invalid expire time in 'set' command"}
 			}
-			ttl = time.Duration(sec) * time.Second
+			opt := strings.ToUpper(args[i].Str)
+			if opt == "PXAT" {
+				exp = time.UnixMilli(n) // past timestamps delete the key
+			} else {
+				if n <= 0 {
+					return resp.Value{Type: resp.Error, Str: "ERR invalid expire time in 'set' command"}
+				}
+				unit := time.Second
+				if opt == "PX" {
+					unit = time.Millisecond
+				}
+				exp = time.Now().Add(time.Duration(n) * unit)
+			}
 			i++
 		default:
 			return syntaxErr()
 		}
 	}
-	s.store.Set(key, val, ttl)
+	s.store.SetAt(key, val, exp)
 	return resp.Value{Type: resp.SimpleString, Str: "OK"}
 }
 
@@ -194,7 +509,7 @@ func (s *Server) cmdExpire(args []resp.Value) resp.Value {
 	}
 	sec, err := strconv.ParseInt(args[1].Str, 10, 64)
 	if err != nil {
-		return resp.Value{Type: resp.Error, Str: "ERR value is not an integer or out of range"}
+		return notIntegerErr()
 	}
 	if s.store.Expire(args[0].Str, time.Duration(sec)*time.Second) {
 		return resp.Value{Type: resp.Integer, Num: 1}
@@ -202,41 +517,153 @@ func (s *Server) cmdExpire(args []resp.Value) resp.Value {
 	return resp.Value{Type: resp.Integer, Num: 0}
 }
 
-// cmdAppend 处理 APPEND key value：返回拼接后的新长度（Integer）。
+// cmdPExpireAt handles PEXPIREAT key ms (absolute expiry; past deletes key).
+func (s *Server) cmdPExpireAt(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return wrongArgs("pexpireat")
+	}
+	ms, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return notIntegerErr()
+	}
+	if s.store.ExpireAt(args[0].Str, time.UnixMilli(ms)) {
+		return resp.Value{Type: resp.Integer, Num: 1}
+	}
+	return resp.Value{Type: resp.Integer, Num: 0}
+}
+
+// cmdAppend handles APPEND key value: returns the new length (Integer).
 func (s *Server) cmdAppend(args []resp.Value) resp.Value {
 	if len(args) != 2 {
 		return wrongArgs("append")
 	}
-	n := s.store.Append(args[0].Str, args[1].Str)
+	n, err := s.store.Append(args[0].Str, args[1].Str)
+	if err != nil {
+		return errReply(err)
+	}
 	return resp.Value{Type: resp.Integer, Num: n}
 }
 
-// cmdIncrBy 处理 INCR/DECR（固定 delta，无额外参数）。cmdName 用于错误消息。
+// cmdIncrBy handles INCR/DECR (fixed delta, no extra args). cmdName is used
+// for error messages.
 func (s *Server) cmdIncrBy(args []resp.Value, delta int64, cmdName string) resp.Value {
 	if len(args) != 1 {
 		return wrongArgs(cmdName)
 	}
 	v, err := s.store.IncrBy(args[0].Str, delta)
 	if err != nil {
-		return resp.Value{Type: resp.Error, Str: err.Error()}
+		return errReply(err)
 	}
 	return resp.Value{Type: resp.Integer, Num: v}
 }
 
-// cmdIncrByWithAmount 处理 INCRBY key increment：解析第二参数为 int64 后调用 IncrBy。
+// cmdIncrByWithAmount handles INCRBY key increment.
 func (s *Server) cmdIncrByWithAmount(args []resp.Value, cmdName string) resp.Value {
 	if len(args) != 2 {
 		return wrongArgs(cmdName)
 	}
 	delta, err := strconv.ParseInt(args[1].Str, 10, 64)
 	if err != nil {
-		return resp.Value{Type: resp.Error, Str: "ERR value is not an integer or out of range"}
+		return notIntegerErr()
 	}
 	v, err := s.store.IncrBy(args[0].Str, delta)
 	if err != nil {
-		return resp.Value{Type: resp.Error, Str: err.Error()}
+		return errReply(err)
 	}
 	return resp.Value{Type: resp.Integer, Num: v}
+}
+
+// cmdListPush handles LPUSH/RPUSH key val [val...]: returns the new length.
+func (s *Server) cmdListPush(args []resp.Value, front bool) resp.Value {
+	if len(args) < 2 {
+		return wrongArgs("lpush/rpush")
+	}
+	vals := make([]string, len(args)-1)
+	for i, a := range args[1:] {
+		vals[i] = a.Str
+	}
+	n, err := s.store.ListPush(args[0].Str, front, vals...)
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
+// cmdListPop handles LPOP/RPOP key [count]. Without count the reply is a
+// single bulk (null when missing); with count it is an array (possibly empty).
+func (s *Server) cmdListPop(args []resp.Value, front bool) resp.Value {
+	if len(args) < 1 || len(args) > 2 {
+		return wrongArgs("lpop/rpop")
+	}
+	var count int64 = 1
+	withCount := len(args) == 2
+	if withCount {
+		var err error
+		count, err = strconv.ParseInt(args[1].Str, 10, 64)
+		if err != nil {
+			return notIntegerErr()
+		}
+	}
+	popped, err := s.store.ListPop(args[0].Str, front, count)
+	if err != nil {
+		return errReply(err)
+	}
+	if !withCount {
+		if len(popped) == 0 {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: popped[0]}
+	}
+	return bulkArray(popped)
+}
+
+// cmdHSet handles HSET key field val [field val ...]: returns the number of
+// newly added fields.
+func (s *Server) cmdHSet(args []resp.Value) resp.Value {
+	if len(args) < 3 || len(args)%2 == 0 {
+		return wrongArgs("hset")
+	}
+	pairs := make([][2]string, 0, len(args)/2)
+	for i := 1; i < len(args); i += 2 {
+		pairs = append(pairs, [2]string{args[i].Str, args[i+1].Str})
+	}
+	n, err := s.store.HashSet(args[0].Str, pairs)
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
+func fieldsOf(args []resp.Value) []string {
+	fields := make([]string, len(args))
+	for i, a := range args {
+		fields[i] = a.Str
+	}
+	return fields
+}
+
+func parseIntArg(s, _ string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func bulkArray(items []string) resp.Value {
+	arr := make([]resp.Value, len(items))
+	for i, s := range items {
+		arr[i] = resp.Value{Type: resp.BulkString, Str: s}
+	}
+	return resp.Value{Type: resp.Array, Arr: arr}
+}
+
+func errReply(err error) resp.Value {
+	return resp.Value{Type: resp.Error, Str: err.Error()}
+}
+
+func notIntegerErr() resp.Value {
+	return resp.Value{Type: resp.Error, Str: "ERR value is not an integer or out of range"}
 }
 
 func wrongArgs(cmd string) resp.Value {

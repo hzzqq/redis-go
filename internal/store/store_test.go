@@ -8,15 +8,15 @@ import (
 func TestSetGet(t *testing.T) {
 	s := New()
 	s.Set("k", "v", 0)
-	got, ok := s.Get("k")
-	if !ok || got != "v" {
-		t.Fatalf("expected (v,true), got (%q,%v)", got, ok)
+	got, ok, err := s.Get("k")
+	if err != nil || !ok || got != "v" {
+		t.Fatalf("expected (v,true,nil), got (%q,%v,%v)", got, ok, err)
 	}
 }
 
 func TestMissingKey(t *testing.T) {
 	s := New()
-	if _, ok := s.Get("nope"); ok {
+	if _, ok, _ := s.Get("nope"); ok {
 		t.Fatal("expected missing key")
 	}
 	if s.Exists("nope") {
@@ -34,7 +34,7 @@ func TestExpire(t *testing.T) {
 	if s.Exists("k") {
 		t.Fatal("should have expired")
 	}
-	if _, ok := s.Get("k"); ok {
+	if _, ok, _ := s.Get("k"); ok {
 		t.Fatal("get should miss after expiry")
 	}
 }
@@ -88,10 +88,11 @@ func TestExpireCommandSemantics(t *testing.T) {
 
 func TestAppendNew(t *testing.T) {
 	s := New()
-	if n := s.Append("k", "abc"); n != 3 {
-		t.Fatalf("expected len=3, got %d", n)
+	n, err := s.Append("k", "abc")
+	if err != nil || n != 3 {
+		t.Fatalf("expected (3,nil), got (%d,%v)", n, err)
 	}
-	if v, ok := s.Get("k"); !ok || v != "abc" {
+	if v, ok, _ := s.Get("k"); !ok || v != "abc" {
 		t.Fatalf("expected abc, got %q ok=%v", v, ok)
 	}
 }
@@ -99,10 +100,11 @@ func TestAppendNew(t *testing.T) {
 func TestAppendExisting(t *testing.T) {
 	s := New()
 	s.Set("k", "foo", 0)
-	if n := s.Append("k", "bar"); n != 6 {
-		t.Fatalf("expected len=6, got %d", n)
+	n, err := s.Append("k", "bar")
+	if err != nil || n != 6 {
+		t.Fatalf("expected (6,nil), got (%d,%v)", n, err)
 	}
-	if v, ok := s.Get("k"); !ok || v != "foobar" {
+	if v, ok, _ := s.Get("k"); !ok || v != "foobar" {
 		t.Fatalf("expected foobar, got %q ok=%v", v, ok)
 	}
 }
@@ -110,7 +112,7 @@ func TestAppendExisting(t *testing.T) {
 func TestAppendPreservesTTL(t *testing.T) {
 	s := New()
 	s.Set("k", "ab", 1000*time.Millisecond)
-	_ = s.Append("k", "cd")
+	_, _ = s.Append("k", "cd")
 	rem, ok := s.TTL("k")
 	if !ok || rem <= 0 {
 		t.Fatalf("TTL should be preserved after APPEND, got rem=%d ok=%v", rem, ok)
@@ -122,10 +124,10 @@ func TestAppendOnExpired(t *testing.T) {
 	s.Set("k", "old", 1*time.Millisecond)
 	time.Sleep(20 * time.Millisecond)
 	// APPEND 应视作新 key（值 = 拼接值，无 TTL）
-	if n := s.Append("k", "new"); n != 3 {
-		t.Fatalf("expected len=3, got %d", n)
+	if n, err := s.Append("k", "new"); err != nil || n != 3 {
+		t.Fatalf("expected (3,nil), got (%d,%v)", n, err)
 	}
-	if v, ok := s.Get("k"); !ok || v != "new" {
+	if v, ok, _ := s.Get("k"); !ok || v != "new" {
 		t.Fatalf("expected 'new', got %q ok=%v", v, ok)
 	}
 	// 新条目应无 TTL
@@ -167,7 +169,7 @@ func TestIncrByNonInteger(t *testing.T) {
 		t.Fatal("expected error on non-integer value")
 	}
 	// 原值不变
-	if v, ok := s.Get("s"); !ok || v != "abc" {
+	if v, ok, _ := s.Get("s"); !ok || v != "abc" {
 		t.Fatalf("value should be unchanged after error, got %q", v)
 	}
 }
@@ -179,7 +181,7 @@ func TestIncrByOverflow(t *testing.T) {
 		t.Fatal("expected overflow error")
 	}
 	// 失败时原值不变
-	if v, ok := s.Get("max"); !ok || v != "9223372036854775807" {
+	if v, ok, _ := s.Get("max"); !ok || v != "9223372036854775807" {
 		t.Fatalf("value should be unchanged after overflow, got %q", v)
 	}
 }
@@ -201,5 +203,315 @@ func TestIncrByPreservesTTL(t *testing.T) {
 	rem, ok := s.TTL("c")
 	if !ok || rem <= 0 {
 		t.Fatalf("TTL should be preserved after IncrBy, got rem=%d ok=%v", rem, ok)
+	}
+}
+
+// ---------------- Phase 3: List ----------------
+
+func TestListPushAndLen(t *testing.T) {
+	s := New()
+	n, err := s.ListPush("l", false, "a", "b", "c") // RPUSH → [a b c]
+	if err != nil || n != 3 {
+		t.Fatalf("RPUSH: expected (3,nil), got (%d,%v)", n, err)
+	}
+	n, err = s.ListPush("l", true, "z") // LPUSH → [z a b c]
+	if err != nil || n != 4 {
+		t.Fatalf("LPUSH: expected (4,nil), got (%d,%v)", n, err)
+	}
+	got, err := s.ListRange("l", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"z", "a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, got)
+		}
+	}
+	if n, _ := s.ListLen("l"); n != 4 {
+		t.Fatalf("expected len 4, got %d", n)
+	}
+}
+
+func TestListRangeNegativeAndClamp(t *testing.T) {
+	s := New()
+	s.ListPush("l", false, "a", "b", "c", "d", "e")
+	cases := []struct {
+		start, stop int64
+		want        []string
+	}{
+		{0, -1, []string{"a", "b", "c", "d", "e"}},
+		{-2, -1, []string{"d", "e"}},
+		{1, 3, []string{"b", "c", "d"}},
+		{0, -100, []string{}}, // stop=-100+5=-5 < start=0 → 空
+	}
+	for _, c := range cases {
+		got, err := s.ListRange("l", c.start, c.stop)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(c.want) {
+			t.Fatalf("LRANGE %d %d: expected %v, got %v", c.start, c.stop, c.want, got)
+		}
+		for i := range c.want {
+			if got[i] != c.want[i] {
+				t.Fatalf("LRANGE %d %d: expected %v, got %v", c.start, c.stop, c.want, got)
+			}
+		}
+	}
+	// 越界：start >= n → 空
+	if got, _ := s.ListRange("l", 10, 20); len(got) != 0 {
+		t.Fatalf("expected empty, got %v", got)
+	}
+	// 缺失 key → 空
+	if got, _ := s.ListRange("nope", 0, -1); len(got) != 0 {
+		t.Fatalf("expected empty for missing key, got %v", got)
+	}
+}
+
+func TestListPop(t *testing.T) {
+	s := New()
+	s.ListPush("l", false, "a", "b", "c")
+	// 单元素 LPOP
+	popped, err := s.ListPop("l", true, 1)
+	if err != nil || len(popped) != 1 || popped[0] != "a" {
+		t.Fatalf("LPOP: expected [a], got %v err=%v", popped, err)
+	}
+	// 带数量 RPOP
+	popped, err = s.ListPop("l", false, 2)
+	if err != nil || len(popped) != 2 || popped[0] != "c" || popped[1] != "b" {
+		t.Fatalf("RPOP 2: expected [c b], got %v err=%v", popped, err)
+	}
+	// 弹空后 key 应被删除
+	if s.Exists("l") {
+		t.Fatal("expected key deleted after popping all elements")
+	}
+	// 缺失 key 弹出 → 空结果
+	if popped, _ := s.ListPop("l", true, 1); len(popped) != 0 {
+		t.Fatalf("expected empty pop on missing key, got %v", popped)
+	}
+	// count=0 → 空结果且不动 key
+	s.ListPush("l2", false, "x")
+	if popped, _ := s.ListPop("l2", true, 0); len(popped) != 0 || !s.Exists("l2") {
+		t.Fatalf("expected count=0 no-op, got %v exists=%v", popped, s.Exists("l2"))
+	}
+	// count<0 → ErrPopRange
+	if _, err := s.ListPop("l2", true, -1); err != ErrPopRange {
+		t.Fatalf("expected ErrPopRange, got %v", err)
+	}
+}
+
+func TestListIndexAndSet(t *testing.T) {
+	s := New()
+	s.ListPush("l", false, "a", "b", "c")
+	if v, ok, _ := s.ListIndex("l", 0); !ok || v != "a" {
+		t.Fatalf("LINDEX 0: expected a, got %q ok=%v", v, ok)
+	}
+	if v, ok, _ := s.ListIndex("l", -1); !ok || v != "c" {
+		t.Fatalf("LINDEX -1: expected c, got %q ok=%v", v, ok)
+	}
+	if _, ok, _ := s.ListIndex("l", 99); ok {
+		t.Fatal("LINDEX 99: expected not found")
+	}
+	if err := s.ListSet("l", 1, "B"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _, _ := s.ListIndex("l", 1); v != "B" {
+		t.Fatalf("expected B after LSET, got %q", v)
+	}
+	if err := s.ListSet("l", 99, "x"); err != ErrIndexOutOfRange {
+		t.Fatalf("expected ErrIndexOutOfRange, got %v", err)
+	}
+	if err := s.ListSet("missing", 0, "x"); err != ErrNoSuchKey {
+		t.Fatalf("expected ErrNoSuchKey, got %v", err)
+	}
+}
+
+func TestListTrim(t *testing.T) {
+	s := New()
+	s.ListPush("l", false, "a", "b", "c", "d", "e")
+	if err := s.ListTrim("l", 1, 3); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.ListRange("l", 0, -1)
+	if len(got) != 3 || got[0] != "b" || got[2] != "d" {
+		t.Fatalf("expected [b c d], got %v", got)
+	}
+	// 修剪为空 → key 删除
+	if err := s.ListTrim("l", 5, 10); err != nil {
+		t.Fatal(err)
+	}
+	if s.Exists("l") {
+		t.Fatal("expected key deleted after trim to empty")
+	}
+	// 缺失 key → 无操作
+	if err := s.ListTrim("nope", 0, -1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListWrongType(t *testing.T) {
+	s := New()
+	s.Set("k", "str", 0)
+	if _, err := s.ListPush("k", true, "v"); err != ErrWrongType {
+		t.Fatalf("expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.ListLen("k"); err != ErrWrongType {
+		t.Fatalf("expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.ListRange("k", 0, -1); err != ErrWrongType {
+		t.Fatalf("expected ErrWrongType, got %v", err)
+	}
+	// list 上做 string 操作
+	s.ListPush("l", false, "a")
+	if _, _, err := s.Get("l"); err != ErrWrongType {
+		t.Fatalf("GET on list: expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.Append("l", "x"); err != ErrWrongType {
+		t.Fatalf("APPEND on list: expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.IncrBy("l", 1); err != ErrWrongType {
+		t.Fatalf("INCRBY on list: expected ErrWrongType, got %v", err)
+	}
+}
+
+func TestListPreservesTTL(t *testing.T) {
+	s := New()
+	s.ListPush("l", false, "a")
+	if !s.Expire("l", 1000*time.Millisecond) {
+		t.Fatal("expire should succeed")
+	}
+	if _, err := s.ListPush("l", false, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if rem, ok := s.TTL("l"); !ok || rem <= 0 {
+		t.Fatalf("TTL should be preserved after ListPush, got rem=%d ok=%v", rem, ok)
+	}
+}
+
+// ---------------- Phase 3: Hash ----------------
+
+func TestHashSetGetAll(t *testing.T) {
+	s := New()
+	if n, _ := s.HashSet("h", [][2]string{{"f", "v"}}); n != 1 {
+		t.Fatalf("expected 1 added, got %d", n)
+	}
+	// 已存在字段 → 不计新增
+	if n, _ := s.HashSet("h", [][2]string{{"f", "v2"}}); n != 0 {
+		t.Fatalf("expected 0 added, got %d", n)
+	}
+	if n, _ := s.HashSet("h", [][2]string{{"g", "w"}}); n != 1 {
+		t.Fatalf("expected 1 added, got %d", n)
+	}
+	if v, ok, _ := s.HashGet("h", "f"); !ok || v != "v2" {
+		t.Fatalf("expected v2, got %q ok=%v", v, ok)
+	}
+	if _, ok, _ := s.HashGet("h", "nope"); ok {
+		t.Fatal("expected missing field")
+	}
+	// HGETALL 按插入序
+	pairs, _ := s.HashGetAll("h")
+	if len(pairs) != 2 || pairs[0][0] != "f" || pairs[0][1] != "v2" || pairs[1][0] != "g" || pairs[1][1] != "w" {
+		t.Fatalf("unexpected HGETALL order: %v", pairs)
+	}
+}
+
+func TestHashDelLenExistsKeysVals(t *testing.T) {
+	s := New()
+	s.HashSet("h", [][2]string{{"a", "1"}, {"b", "2"}, {"c", "3"}})
+	if n, _ := s.HashLen("h"); n != 3 {
+		t.Fatalf("expected len 3, got %d", n)
+	}
+	// 删 2 个（1 个不存在）
+	if n, _ := s.HashDel("h", []string{"a", "b", "zz"}); n != 2 {
+		t.Fatalf("expected 2 deleted, got %d", n)
+	}
+	if ok, _ := s.HashExists("h", "a"); ok {
+		t.Fatal("a should be gone")
+	}
+	if ok, _ := s.HashExists("h", "c"); !ok {
+		t.Fatal("c should remain")
+	}
+	keys, _ := s.HashKeys("h")
+	if len(keys) != 1 || keys[0] != "c" {
+		t.Fatalf("expected [c], got %v", keys)
+	}
+	vals, _ := s.HashVals("h")
+	if len(vals) != 1 || vals[0] != "3" {
+		t.Fatalf("expected [3], got %v", vals)
+	}
+	// 删空 → key 删除
+	s.HashDel("h", []string{"c"})
+	if s.Exists("h") {
+		t.Fatal("expected key deleted after removing last field")
+	}
+	if n, _ := s.HashLen("h"); n != 0 {
+		t.Fatalf("expected len 0 on missing key, got %d", n)
+	}
+}
+
+func TestHashIncrBy(t *testing.T) {
+	s := New()
+	// 新 hash + 新 field → delta
+	if v, err := s.HashIncrBy("h", "n", 5); err != nil || v != 5 {
+		t.Fatalf("expected (5,nil), got (%d,%v)", v, err)
+	}
+	if v, err := s.HashIncrBy("h", "n", -2); err != nil || v != 3 {
+		t.Fatalf("expected (3,nil), got (%d,%v)", v, err)
+	}
+	// 非整数字段
+	s.HashSet("h", [][2]string{{"s", "abc"}})
+	if _, err := s.HashIncrBy("h", "s", 1); err == nil {
+		t.Fatal("expected error on non-integer field")
+	}
+	// 溢出
+	s.HashSet("h", [][2]string{{"max", "9223372036854775807"}})
+	if _, err := s.HashIncrBy("h", "max", 1); err == nil {
+		t.Fatal("expected overflow error")
+	}
+	// hash 上的 TTL 保留
+	if !s.Expire("h", 1000*time.Millisecond) {
+		t.Fatal("expire should succeed")
+	}
+	if _, err := s.HashIncrBy("h", "n", 1); err != nil {
+		t.Fatal(err)
+	}
+	if rem, ok := s.TTL("h"); !ok || rem <= 0 {
+		t.Fatalf("TTL should be preserved after HashIncrBy, got rem=%d ok=%v", rem, ok)
+	}
+}
+
+func TestHashWrongType(t *testing.T) {
+	s := New()
+	s.Set("k", "str", 0)
+	if _, err := s.HashSet("k", [][2]string{{"f", "v"}}); err != ErrWrongType {
+		t.Fatalf("expected ErrWrongType, got %v", err)
+	}
+	if _, _, err := s.HashGet("k", "f"); err != ErrWrongType {
+		t.Fatalf("expected ErrWrongType, got %v", err)
+	}
+	// hash 上做 string 操作
+	s.HashSet("h", [][2]string{{"f", "v"}})
+	if _, _, err := s.Get("h"); err != ErrWrongType {
+		t.Fatalf("GET on hash: expected ErrWrongType, got %v", err)
+	}
+}
+
+func TestFlushKeepsSweeper(t *testing.T) {
+	s := New()
+	s.Set("a", "1", 0)
+	s.ListPush("l", false, "x")
+	s.HashSet("h", [][2]string{{"f", "v"}})
+	s.Flush()
+	if s.Len() != 0 {
+		t.Fatalf("expected empty store after Flush, got %d", s.Len())
+	}
+	// Flush 后写入仍可用（sweeper 协程未泄漏中断）
+	s.Set("b", "2", 0)
+	if v, ok, _ := s.Get("b"); !ok || v != "2" {
+		t.Fatalf("expected (2,true), got (%q,%v)", v, ok)
 	}
 }
