@@ -8,14 +8,28 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/hzzqq/redis-go/internal/resp"
 )
 
-// AOF is a concurrency-safe append-only file of RESP-encoded commands.
+// AOF is a concurrency-safe append-only file of RESP-encoded commands, with
+// a pluggable fsync policy (Redis appendfsync):
+//   - "always": every Log call also fsyncs before returning — the caller's
+//     reply only goes out once the bytes survive a power loss;
+//   - "everysec": a background goroutine fsyncs once per second — a crash
+//     loses at most ~1s of acknowledged writes (Redis's default trade-off);
+//   - "no" (default): bytes reach the OS page cache only; durability is the
+//     kernel's business (original redis-go behavior).
 type AOF struct {
-	mu sync.Mutex
-	f  *os.File
+	mu        sync.Mutex
+	f         *os.File
+	fsyncMode string
+
+	// everysec loop lifecycle: syncStop is closed to stop the ticker
+	// goroutine, syncDone follows when it has exited (guarded by mu).
+	syncStop chan struct{}
+	syncDone chan struct{}
 }
 
 // Open opens path for appending, creating it if needed.
@@ -27,11 +41,64 @@ func Open(path string) (*AOF, error) {
 	return &AOF{f: f}, nil
 }
 
-// Log appends one command value to the file.
+// SetFsync switches the fsync policy ("always" / "everysec" / "no"; unknown
+// values fall back to "no"). Switching to everysec starts the background
+// flusher, switching away stops it. Safe to call repeatedly.
+func (a *AOF) SetFsync(mode string) {
+	if mode != "always" && mode != "everysec" && mode != "no" {
+		mode = "no"
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.fsyncMode = mode
+	if mode == "everysec" {
+		if a.syncStop == nil { // not running yet
+			a.syncStop = make(chan struct{})
+			a.syncDone = make(chan struct{})
+			go a.fsyncLoop(a.syncStop, a.syncDone)
+		}
+		return
+	}
+	if a.syncStop != nil { // running → stop it
+		close(a.syncStop)
+		a.syncStop, a.syncDone = nil, nil
+	}
+}
+
+// fsyncLoop flushes the OS buffers once per second until stop is closed.
+// The fsync itself takes a.mu (shared with Log/Rewrite/Close), so a big
+// backlog cannot stall appends beyond one fsync duration.
+func (a *AOF) fsyncLoop(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			a.Sync()
+		}
+	}
+}
+
+// fsyncNow syncs the file honoring the current mode; called by Log under mu.
+func (a *AOF) fsyncNow() error {
+	if a.fsyncMode == "always" {
+		return a.f.Sync()
+	}
+	return nil
+}
+
+// Log appends one command value to the file. With the "always" policy the
+// data is fsynced before Log returns (synchronous durability).
 func (a *AOF) Log(v resp.Value) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return resp.WriteValue(a.f, v)
+	if err := resp.WriteValue(a.f, v); err != nil {
+		return err
+	}
+	return a.fsyncNow()
 }
 
 // Sync flushes OS buffers to disk.
@@ -41,8 +108,16 @@ func (a *AOF) Sync() error {
 	return a.f.Sync()
 }
 
-// Close closes the file.
+// Close stops any background flusher and closes the file.
 func (a *AOF) Close() error {
+	a.mu.Lock()
+	stop, done := a.syncStop, a.syncDone
+	a.syncStop, a.syncDone = nil, nil
+	a.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.f.Close()

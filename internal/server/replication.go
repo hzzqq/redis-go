@@ -490,10 +490,11 @@ func (s *Server) applyFromMaster(v resp.Value) {
 	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	setPre := s.setPreState(v)
 	reply := s.dispatch(v)
 	var frames []resp.Value
 	if reply.Type != resp.Error {
-		if canon, ok := canonicalWrite(v, reply); ok {
+		if canon, ok := canonicalWrite(v, reply, setPre); ok {
 			frames = append(frames, canon)
 		}
 	}
@@ -507,9 +508,10 @@ func (s *Server) applyMasterBlock(block []resp.Value) {
 	defer s.applyMu.Unlock()
 	frames := []resp.Value{respCmd("MULTI")}
 	for _, q := range block {
+		setPre := s.setPreState(q)
 		reply := s.dispatch(q)
 		if isWriteCmd(q) && reply.Type != resp.Error {
-			if canon, ok := canonicalWrite(q, reply); ok {
+			if canon, ok := canonicalWrite(q, reply, setPre); ok {
 				frames = append(frames, canon)
 			}
 		}

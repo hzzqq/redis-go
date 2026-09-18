@@ -56,6 +56,10 @@ var cmdArity = map[string][2]int{
 	"EVAL": {2, -1}, "EVALSHA": {2, -1}, "SCRIPT": {1, -1},
 	"REPLICAOF": {2, 2}, "SLAVEOF": {2, 2}, "PSYNC": {2, 2}, "SYNC": {0, 0},
 	"REPLCONF": {2, -1},
+	// Phase 9
+	"SCAN": {1, -1}, "SSCAN": {2, -1}, "HSCAN": {2, -1}, "ZSCAN": {2, -1},
+	"OBJECT": {2, -1},
+	"LMOVE":  {4, 4}, "LINSERT": {4, 4}, "LPOS": {2, -1},
 }
 
 // resetTxn clears the connection's transaction state.
@@ -129,9 +133,10 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 		if s.isReplica() && isWriteCmd(q) {
 			r = readonlyErr()
 		} else {
+			pre := s.setPreState(q)
 			r = s.dispatch(q)
 			if isWriteCmd(q) && r.Type != resp.Error {
-				if c, ok := canonicalWrite(q, r); ok {
+				if c, ok := canonicalWrite(q, r, pre); ok {
 					canon = append(canon, c)
 				}
 			}

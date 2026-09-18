@@ -78,6 +78,11 @@ type Server struct {
 	// cache is per-process memory and lost on restart (Redis same).
 	scriptMu sync.Mutex
 	scripts  map[string]string
+
+	// aofFsync is the AOF fsync policy for reporting (INFO/CONFIG): "always",
+	// "everysec" or "no". The actual flushing runs inside persist.AOF; set via
+	// ConfigureAOF (default "no" for library users, main.go passes -appendfsync).
+	aofFsync string
 }
 
 // New returns a ready-to-serve in-memory Server.
@@ -140,6 +145,21 @@ func (s *Server) Close() error {
 		return nil
 	}
 	return s.aof.Close()
+}
+
+// ConfigureAOF sets the AOF fsync policy (Redis appendfsync): "always" = sync
+// after every write command, "everysec" = a background goroutine flushes once
+// per second (a crash loses at most ~1s of acknowledged writes), "no" = let
+// the OS decide. No-op when the AOF is disabled.
+func (s *Server) ConfigureAOF(mode string) {
+	if s.aof == nil {
+		return
+	}
+	if mode != "always" && mode != "everysec" && mode != "no" {
+		mode = "no"
+	}
+	s.aof.SetFsync(mode)
+	s.aofFsync = mode
 }
 
 // Listen accepts connections on addr (e.g. ":6379") until an error occurs.
@@ -483,10 +503,11 @@ func (s *Server) apply(v resp.Value) resp.Value {
 	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	setPre := s.setPreState(v)
 	reply := s.dispatch(v)
 	var frames []resp.Value
 	if reply.Type != resp.Error {
-		if canon, ok := canonicalWrite(v, reply); ok {
+		if canon, ok := canonicalWrite(v, reply, setPre); ok {
 			frames = append(frames, canon)
 		}
 		// 写命令提交后触碰 WATCH 了这些 key 的连接（乐观锁 CAS 标记）。
@@ -517,6 +538,7 @@ var writeCmds = map[string]bool{
 	"SET": true, "SETEX": true, "DEL": true, "EXPIRE": true, "PEXPIREAT": true,
 	"APPEND": true, "INCR": true, "DECR": true, "INCRBY": true,
 	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true, "LTRIM": true,
+	"LMOVE": true, "LINSERT": true,
 	"HSET": true, "HDEL": true, "HINCRBY": true,
 	"SADD": true, "SREM": true, "SPOP": true,
 	"ZADD": true, "ZINCRBY": true, "ZREM": true,
@@ -533,7 +555,11 @@ var writeCmds = map[string]bool{
 // verbatim or state drifts after a restart. A popped-nothing SPOP (null or
 // empty reply) is not logged at all. Other write commands are stored
 // verbatim. The second return value is false for non-write commands.
-func canonicalWrite(v, reply resp.Value) (resp.Value, bool) {
+//
+// setPre 是 SET（仅 NX+GET 组合）执行前的 key 存在性快照，用于消歧 null 回复：
+// NX+GET 在新 key 上成功时旧值为 null（必须落盘），与 NX 失败的 null 无法从
+// reply 区分。其余命令忽略该参数。
+func canonicalWrite(v, reply resp.Value, setPre bool) (resp.Value, bool) {
 	if v.Type != resp.Array || len(v.Arr) == 0 {
 		return resp.Value{}, false
 	}
@@ -573,35 +599,76 @@ func canonicalWrite(v, reply resp.Value) (resp.Value, bool) {
 		return respCmd("SET", args[0].Str, args[2].Str,
 			"PXAT", msAt(time.Now().Add(time.Duration(sec)*time.Second))), true
 	case "EXPIRE":
-		if len(args) != 2 {
+		// 条件未命中（Integer 0）没有状态变化，不落盘
+		if reply.Type == resp.Integer && reply.Num == 0 {
+			return resp.Value{}, false
+		}
+		if len(args) < 2 {
 			return v, true
 		}
 		sec, err := strconv.ParseInt(args[1].Str, 10, 64)
 		if err != nil {
 			return v, true
 		}
-		return respCmd("PEXPIREAT", args[0].Str,
-			msAt(time.Now().Add(time.Duration(sec)*time.Second))), true
+		out := []resp.Value{
+			resp.Value{Type: resp.BulkString, Str: "PEXPIREAT"},
+			args[0],
+			resp.Value{Type: resp.BulkString, Str: msAt(time.Now().Add(time.Duration(sec) * time.Second))},
+		}
+		// 选项原样保留：NX/XX/GT/LT 比较的是绝对时间，回放时 key 状态与
+		// 执行时刻一致（AOF 全序回放），条件重判结果相同。
+		out = append(out, args[2:]...)
+		return resp.Value{Type: resp.Array, Arr: out}, true
 	case "SET":
-		out := make([]resp.Value, len(v.Arr))
-		out[0] = resp.Value{Type: resp.BulkString, Str: "SET"}
-		copy(out[1:], args)
-		for i := 1; i < len(out)-1; i++ {
-			opt := strings.ToUpper(out[i].Str)
-			if opt != "EX" && opt != "PX" {
+		if reply.Type == resp.BulkString && reply.Null {
+			// null 回复的成因判定：
+			//   NX 无 GET / XX（含 XX+GET，key 缺失时旧值必为 null）→ 条件
+			//   失败，无状态变化，不落盘；
+			//   GET 无 NX/XX → SET 无条件生效（新 key 旧值为 null），必须落盘；
+			//   NX+GET → 执行前快照消歧：key 原不存在 = NX 通过，落盘。
+			nx, xx, get := setFlags(args)
+			if !(get && (!nx && !xx || nx && !setPre)) {
+				return resp.Value{}, false
+			}
+		}
+		// 重组选项：剥掉 NX/XX/GET（条件与副作用已在执行时刻定格），保留
+		// KEEPTTL，EX/PX 绝对化为 PXAT（原逻辑）。剥 NX/XX 后回放为无条件
+		// 覆盖——执行时刻条件已通过，回放到此处时 key 状态一致，覆盖等价。
+		out := make([]resp.Value, 0, len(v.Arr))
+		out = append(out,
+			resp.Value{Type: resp.BulkString, Str: "SET"},
+			args[0], args[1])
+		for i := 2; i < len(args); i++ {
+			opt := strings.ToUpper(args[i].Str)
+			switch opt {
+			case "NX", "XX", "GET":
 				continue
+			case "KEEPTTL":
+				out = append(out, args[i])
+			case "EX", "PX", "PXAT":
+				if i+1 >= len(args) {
+					return v, true
+				}
+				if opt == "PXAT" {
+					out = append(out, args[i], args[i+1])
+					i++
+					continue
+				}
+				n, err := strconv.ParseInt(args[i+1].Str, 10, 64)
+				if err != nil || n <= 0 {
+					return v, true // replay would fail identically; keep verbatim
+				}
+				unit := time.Second
+				if opt == "PX" {
+					unit = time.Millisecond
+				}
+				out = append(out,
+					resp.Value{Type: resp.BulkString, Str: "PXAT"},
+					resp.Value{Type: resp.BulkString, Str: msAt(time.Now().Add(time.Duration(n) * unit))})
+				i++
+			default:
+				return v, true
 			}
-			n, err := strconv.ParseInt(out[i+1].Str, 10, 64)
-			if err != nil || n <= 0 {
-				return v, true // replay would fail identically; keep verbatim
-			}
-			unit := time.Second
-			if opt == "PX" {
-				unit = time.Millisecond
-			}
-			out[i] = resp.Value{Type: resp.BulkString, Str: "PXAT"}
-			out[i+1] = resp.Value{Type: resp.BulkString, Str: msAt(time.Now().Add(time.Duration(n) * unit))}
-			break
 		}
 		return resp.Value{Type: resp.Array, Arr: out}, true
 	default:
@@ -610,6 +677,40 @@ func canonicalWrite(v, reply resp.Value) (resp.Value, bool) {
 }
 
 func msAt(t time.Time) string { return strconv.FormatInt(t.UnixMilli(), 10) }
+
+// setFlags 扫描 SET 命令选项，报告 NX/XX/GET 是否出现。EX/PX/PXAT 的取值是
+// 数字字面量，不会误判为选项词；非法取值会使命令以 Error 结束，从而根本
+// 不会进入 canonicalWrite。
+func setFlags(args []resp.Value) (nx, xx, get bool) {
+	for _, a := range args[2:] {
+		switch strings.ToUpper(a.Str) {
+		case "NX":
+			nx = true
+		case "XX":
+			xx = true
+		case "GET":
+			get = true
+		}
+	}
+	return nx, xx, get
+}
+
+// setPreState 捕获 SET 执行前的 key 存在性，供 canonicalWrite 消歧 NX+GET 的
+// null 回复（key 原不存在 = NX 通过 = 必须落盘）。仅 NX+GET 组合才访问
+// store，其余命令/组合零开销。返回值与「无需快照」共用 false：canonicalWrite
+// 只在 NX+GET 分支读取它，语义不冲突。调用方与 dispatch 同锁（applyMu 或
+// 事务/脚本临界区），快照与执行之间无并发写。
+func (s *Server) setPreState(v resp.Value) bool {
+	if v.Type != resp.Array || len(v.Arr) < 3 || !strings.EqualFold(v.Arr[0].Str, "SET") {
+		return false
+	}
+	nx, _, get := setFlags(v.Arr[1:])
+	if !nx || !get {
+		return false
+	}
+	_, ok, _ := s.store.Get(v.Arr[1].Str)
+	return ok
+}
 
 // respCmd builds an array-of-bulk-strings RESP value from plain strings.
 func respCmd(parts ...string) resp.Value {
@@ -974,6 +1075,22 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdZRangeByLex(args, true)
 	case "ZRANDMEMBER":
 		return s.cmdZRandMember(args)
+	case "SCAN":
+		return s.cmdScan(args)
+	case "SSCAN":
+		return s.cmdSScan(args)
+	case "HSCAN":
+		return s.cmdHScan(args)
+	case "ZSCAN":
+		return s.cmdZScan(args)
+	case "OBJECT":
+		return s.cmdObject(args)
+	case "LMOVE":
+		return s.cmdLMove(args)
+	case "LINSERT":
+		return s.cmdLInsert(args)
+	case "LPOS":
+		return s.cmdLPos(args)
 	case "PUBLISH":
 		return s.cmdPublish(args)
 	case "REPLICAOF", "SLAVEOF":
@@ -990,12 +1107,18 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 	}
 }
 
+// cmdSet handles the full SET form: SET key val [NX|XX] [KEEPTTL]
+// [EX s|PX ms|PXAT ms] [GET]. NX/XX gate the write on (non-)existence, GET
+// turns the reply into the old value (null when the key was absent),
+// KEEPTTL preserves the existing TTL (mutually exclusive with EX/PX/PXAT,
+// as Redis rejects the combination with a syntax error).
 func (s *Server) cmdSet(args []resp.Value) resp.Value {
 	if len(args) < 2 {
 		return wrongArgs("set")
 	}
 	key, val := args[0].Str, args[1].Str
 	var exp time.Time // zero = no expiry
+	keepTTL, nx, xx, wantOld := false, false, false, false
 	for i := 2; i < len(args); i++ {
 		switch strings.ToUpper(args[i].Str) {
 		case "EX", "PX", "PXAT":
@@ -1020,11 +1143,37 @@ func (s *Server) cmdSet(args []resp.Value) resp.Value {
 				exp = time.Now().Add(time.Duration(n) * unit)
 			}
 			i++
+		case "KEEPTTL":
+			keepTTL = true
+		case "NX":
+			nx = true
+		case "XX":
+			xx = true
+		case "GET":
+			wantOld = true
 		default:
 			return syntaxErr()
 		}
 	}
-	s.store.SetAt(key, val, exp)
+	if nx && xx {
+		return syntaxErr()
+	}
+	if keepTTL && !exp.IsZero() {
+		return syntaxErr()
+	}
+	old, didSet, err := s.store.SetFull(key, val, exp, keepTTL, nx, xx, wantOld)
+	if err != nil {
+		return errReply(err)
+	}
+	if wantOld {
+		if old == nil {
+			return resp.Value{Type: resp.BulkString, Null: true}
+		}
+		return resp.Value{Type: resp.BulkString, Str: *old}
+	}
+	if !didSet {
+		return resp.Value{Type: resp.BulkString, Null: true}
+	}
 	return resp.Value{Type: resp.SimpleString, Str: "OK"}
 }
 
@@ -1040,33 +1189,67 @@ func (s *Server) cmdSetEX(args []resp.Value) resp.Value {
 	return resp.Value{Type: resp.SimpleString, Str: "OK"}
 }
 
+// cmdExpire handles EXPIRE key seconds [NX|XX|GT|LT ...] (options may
+// combine, e.g. XX+GT; NX+XX / GT+LT conflict). Returns 1 when the expiry
+// was set, 0 when the key is missing or a condition failed.
 func (s *Server) cmdExpire(args []resp.Value) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return wrongArgs("expire")
 	}
 	sec, err := strconv.ParseInt(args[1].Str, 10, 64)
 	if err != nil {
 		return notIntegerErr()
 	}
-	if s.store.Expire(args[0].Str, time.Duration(sec)*time.Second) {
+	cond, errv := parseExpireConds(args[2:], "expire")
+	if errv.Type == resp.Error {
+		return errv
+	}
+	if s.store.ExpireAtOpts(args[0].Str, time.Now().Add(time.Duration(sec)*time.Second),
+		cond["NX"], cond["XX"], cond["GT"], cond["LT"]) {
 		return resp.Value{Type: resp.Integer, Num: 1}
 	}
 	return resp.Value{Type: resp.Integer, Num: 0}
 }
 
-// cmdPExpireAt handles PEXPIREAT key ms (absolute expiry; past deletes key).
+// cmdPExpireAt handles PEXPIREAT key ms [NX|XX|GT|LT ...] (absolute expiry;
+// past deletes key). Shares the option grammar with EXPIRE.
 func (s *Server) cmdPExpireAt(args []resp.Value) resp.Value {
-	if len(args) != 2 {
+	if len(args) < 2 {
 		return wrongArgs("pexpireat")
 	}
 	ms, err := strconv.ParseInt(args[1].Str, 10, 64)
 	if err != nil {
 		return notIntegerErr()
 	}
-	if s.store.ExpireAt(args[0].Str, time.UnixMilli(ms)) {
+	cond, errv := parseExpireConds(args[2:], "pexpireat")
+	if errv.Type == resp.Error {
+		return errv
+	}
+	if s.store.ExpireAtOpts(args[0].Str, time.UnixMilli(ms),
+		cond["NX"], cond["XX"], cond["GT"], cond["LT"]) {
 		return resp.Value{Type: resp.Integer, Num: 1}
 	}
 	return resp.Value{Type: resp.Integer, Num: 0}
+}
+
+// parseExpireConds parses the NX/XX/GT/LT tail shared by EXPIRE/PEXPIREAT,
+// rejecting the incompatible pairs with the Redis wording.
+func parseExpireConds(args []resp.Value, _ string) (map[string]bool, resp.Value) {
+	cond := map[string]bool{"NX": false, "XX": false, "GT": false, "LT": false}
+	for _, a := range args {
+		opt := strings.ToUpper(a.Str)
+		switch opt {
+		case "NX", "XX", "GT", "LT":
+			cond[opt] = true
+		default:
+			return nil, syntaxErr()
+		}
+	}
+	if cond["NX"] && cond["XX"] || cond["GT"] && cond["LT"] {
+		return nil, resp.Value{Type: resp.Error,
+			Str: "ERR NX and XX, GT or LT options at the same time are not compatible"}
+	}
+	return cond, resp.Value{}
 }
 
 // cmdAppend handles APPEND key value: returns the new length (Integer).
@@ -1531,6 +1714,7 @@ func (s *Server) infoSections() []infoSection {
 		"rdb_enabled:" + rdbEnabled + "\r\n" +
 		fmt.Sprintf("rdb_last_save_time:%d\r\n", s.lastSave.Load()) +
 		"aof_enabled:" + aofEnabled + "\r\n" +
+		"aof_fsync:" + s.aofFsync + "\r\n" +
 		"\r\n"
 	keyspace := "# Keyspace\r\n" +
 		fmt.Sprintf("db0:keys=%d,expires=%d\r\n", keys, expires)
@@ -1568,7 +1752,7 @@ func (s *Server) cmdConfig(args []resp.Value) resp.Value {
 		}
 		name := strings.ToLower(args[1].Str)
 		switch name {
-		case "appendonly", "databases", "maxmemory", "save":
+		case "appendonly", "appendfsync", "databases", "maxmemory", "save":
 			return bulkArray([]string{name, s.configValue(name)})
 		}
 		return bulkArray(nil)
@@ -1592,6 +1776,14 @@ func (s *Server) configValue(name string) string {
 			return "yes"
 		}
 		return "no"
+	case "appendfsync":
+		if s.aof == nil {
+			return "no"
+		}
+		if s.aofFsync == "" {
+			return "no"
+		}
+		return s.aofFsync
 	case "databases":
 		return "16"
 	case "maxmemory":

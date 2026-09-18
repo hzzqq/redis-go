@@ -150,6 +150,46 @@ func (s *Store) Set(key, val string, ttl time.Duration) {
 	s.SetAt(key, val, exp)
 }
 
+// SetFull is the full SET form behind SET key val [NX|XX] [KEEPTTL]
+// [EX s|PX ms|PXAT ms] [GET]:
+//   - nx: set only when the key does NOT exist; xx: only when it does.
+//     When the condition fails the store is untouched (didSet=false).
+//   - keepTTL: keep the existing TTL instead of exp (caller guarantees the
+//     two are not combined, as Redis rejects that at parse time).
+//   - wantOld (GET): returns the old string value; a non-string old value
+//     fails with ErrWrongType and nothing is written (Redis semantics).
+//     Expired/missing keys count as absent (old=nil).
+//
+// Expired keys are lazily deleted, so SET on an expired key writes fresh.
+func (s *Store) SetFull(key, val string, exp time.Time, keepTTL, nx, xx, wantOld bool) (*string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := validLocked(s.m, key)
+	var old *string
+	if ok && wantOld {
+		sv, isStr := e.val.(string)
+		if !isStr {
+			return nil, false, ErrWrongType
+		}
+		cp := sv
+		old = &cp
+	}
+	if ok && nx {
+		return old, false, nil
+	}
+	if !ok && xx {
+		return nil, false, nil
+	}
+	var newExp time.Time
+	if keepTTL && ok {
+		newExp = e.expiry
+	} else {
+		newExp = exp
+	}
+	s.m[key] = entry{val: val, expiry: newExp}
+	return old, true, nil
+}
+
 // Append atomically appends val to the string at key and returns the new
 // length. A missing/expired key is treated as an empty string (new entry has
 // no TTL). ErrWrongType if the key holds a list/hash.
@@ -248,6 +288,45 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 	return s.ExpireAt(key, time.Now().Add(ttl))
 }
 
+// ExpireAtOpts is the conditional EXPIRE/PEXPIREAT core (Redis 7 options):
+//   - nx: set only when the key has NO expiry
+//   - xx: set only when the key HAS an expiry
+//   - gt: set only when the new expiry is strictly greater than the current
+//     one (fails when the key has no expiry)
+//   - lt: set only when the new expiry is strictly less than the current one,
+//     or when the key has no expiry
+//
+// Unmet conditions leave the key untouched and return false. A past expiry
+// that passes the conditions deletes the key (returns true), matching Redis.
+func (s *Store) ExpireAtOpts(key string, exp time.Time, nx, xx, gt, lt bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := validLocked(s.m, key)
+	if !ok {
+		return false
+	}
+	oldHas := !e.expiry.IsZero()
+	if nx && oldHas {
+		return false
+	}
+	if xx && !oldHas {
+		return false
+	}
+	if gt && (!oldHas || !exp.After(e.expiry)) {
+		return false
+	}
+	if lt && (oldHas && !exp.Before(e.expiry)) {
+		return false
+	}
+	if !exp.IsZero() && !exp.After(time.Now()) {
+		delete(s.m, key)
+		return true
+	}
+	e.expiry = exp
+	s.m[key] = e
+	return true
+}
+
 // TTL returns the remaining TTL.
 //   - exists == false : key missing
 //   - rem  < 0        : key exists but has no expiry
@@ -292,7 +371,12 @@ func (s *Store) Type(key string) string {
 	if !ok {
 		return "none"
 	}
-	switch e.val.(type) {
+	return typeName(e.val)
+}
+
+// typeName maps a stored value to its Redis type name.
+func typeName(v any) string {
+	switch v.(type) {
 	case string:
 		return "string"
 	case *list:
@@ -305,6 +389,92 @@ func (s *Store) Type(key string) string {
 		return "zset"
 	default:
 		return "none"
+	}
+}
+
+// ScanAll returns every live key (expired-but-unswept entries excluded) in
+// sorted order, filtered to typeFilter when non-empty ("string"/"list"/
+// "hash"/"set"/"zset"). SCAN turns this snapshot into cursor pages on the
+// server side; a stable sort keeps one logical traversal consistent across
+// calls (within the usual SCAN no-guarantees for concurrent mutations).
+func (s *Store) ScanAll(typeFilter string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	out := make([]string, 0, len(s.m))
+	for k, e := range s.m {
+		if !e.expiry.IsZero() && now.After(e.expiry) {
+			continue
+		}
+		if typeFilter != "" && typeName(e.val) != typeFilter {
+			continue
+		}
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Encoding returns the internal encoding name of key for OBJECT ENCODING:
+//   - string: "int" (fits int64) / "embstr" (≤44 bytes) / "raw"
+//   - list:   "listpack" (≤128 elems) / "quicklist"
+//   - hash:   "listpack" (≤128 fields) / "hashtable"
+//   - set:    "intset" (all-integer, ≤512) / "listpack" (≤128) / "hashtable"
+//   - zset:   "listpack" (≤128 members) / "skiplist"
+//
+// The thresholds mirror Redis 7 defaults (hash/set/zset-max-listpack-entries
+// 128, set-max-intset-entries 512); as redis-go stores everything as native
+// Go structures these names are a faithful *mapping*, not real encodings.
+// missing → ("", false); wrong-type never happens (the value type IS the
+// Redis type), so no error path.
+func (s *Store) Encoding(key string) (string, bool) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return "", false
+	}
+	switch v := e.val.(type) {
+	case string:
+		if _, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return "int", true
+		}
+		if len(v) <= 44 {
+			return "embstr", true
+		}
+		return "raw", true
+	case *list:
+		if len(v.items) <= 128 {
+			return "listpack", true
+		}
+		return "quicklist", true
+	case *hash:
+		if len(v.m) <= 128 {
+			return "listpack", true
+		}
+		return "hashtable", true
+	case *set:
+		allInt := len(v.m) > 0
+		for m := range v.m {
+			if _, err := strconv.ParseInt(m, 10, 64); err != nil {
+				allInt = false
+				break
+			}
+		}
+		if allInt && len(v.m) <= 512 {
+			return "intset", true
+		}
+		if len(v.m) <= 128 {
+			return "listpack", true
+		}
+		return "hashtable", true
+	case *zsetVal:
+		if v.sl.length <= 128 {
+			return "listpack", true
+		}
+		return "skiplist", true
+	default:
+		return "", false
 	}
 }
 
@@ -589,6 +759,156 @@ func (s *Store) ListTrim(key string, start, stop int64) error {
 	}
 	lst.items = kept
 	return nil
+}
+
+// ListMove atomically pops one element from the head (srcLeft) or tail of
+// src and pushes it onto the head (dstLeft) or tail of dst — the Redis LMOVE
+// core, done under a single write lock so no other command can observe the
+// intermediate state. src == dst rotates the list (LMOVE l l LEFT RIGHT ==
+// RPOP+LPUSH). A missing src returns ("", false, nil); a popped-empty src is
+// deleted (unless it is also dst); a newly created dst carries no TTL, an
+// existing dst keeps its TTL (Redis semantics).
+func (s *Store) ListMove(src, dst string, srcLeft, dstLeft bool) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	se, ok := validLocked(s.m, src)
+	if !ok {
+		return "", false, nil
+	}
+	sl, isList := se.val.(*list)
+	if !isList {
+		return "", false, ErrWrongType
+	}
+	var dl *list
+	var dstExp time.Time
+	if src == dst {
+		dl = sl // 同 key 轮转：弹出后立即推回，key 不会变空
+	} else {
+		de, dok := validLocked(s.m, dst)
+		if dok {
+			var isList bool
+			dl, isList = de.val.(*list)
+			if !isList {
+				return "", false, ErrWrongType
+			}
+			dstExp = de.expiry
+		} else {
+			dl = &list{}
+		}
+	}
+	var val string
+	n := len(sl.items)
+	if srcLeft {
+		val = sl.items[0]
+		sl.items = sl.items[1:]
+	} else {
+		val = sl.items[n-1]
+		sl.items = sl.items[:n-1]
+	}
+	if dstLeft {
+		dl.items = append([]string{val}, dl.items...)
+	} else {
+		dl.items = append(dl.items, val)
+	}
+	if src != dst {
+		if len(sl.items) == 0 {
+			delete(s.m, src) // 弹空的源 key 删除（Redis 语义）
+		}
+		s.m[dst] = entry{val: dl, expiry: dstExp}
+	}
+	return val, true, nil
+}
+
+// ListInsert inserts val before (before=true) or after the first occurrence
+// of pivot in the list at key. Returns the new length; a missing key → 0, a
+// missing pivot → -1 (key untouched), ErrWrongType on a non-list key.
+func (s *Store) ListInsert(key string, before bool, pivot, val string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := validLocked(s.m, key)
+	if !ok {
+		return 0, nil
+	}
+	lst, isList := e.val.(*list)
+	if !isList {
+		return 0, ErrWrongType
+	}
+	for i, it := range lst.items {
+		if it == pivot {
+			pos := i
+			if !before {
+				pos = i + 1
+			}
+			// 先把新元素包装成独立切片再 splice，避免 append 别名写穿
+			grown := append(lst.items[:pos:pos], append([]string{val}, lst.items[pos:]...)...)
+			lst.items = grown
+			return int64(len(grown)), nil
+		}
+	}
+	return -1, nil
+}
+
+// ListPos finds occurrences of elem in the list at key (Redis LPOS core):
+//   - rank>0: scan from the head, start collecting at the rank-th match;
+//     rank<0: scan from the tail, start at the |rank|-th match and walk
+//     toward the head (results in discovery order, i.e. descending index);
+//   - count>0 collects up to count matches (count<0 → just the first one);
+//   - maxLen>0 caps the TOTAL number of elements compared across the whole
+//     search, including the collection phase (Redis t_list.c behavior: the
+//     comparison counter keeps running while collecting).
+//
+// Returns the matched 0-based indices (nil when nothing matched),
+// ErrWrongType on a non-list key. rank==0 is rejected by the caller.
+func (s *Store) ListPos(key, elem string, rank, count, maxLen int64) ([]int64, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return nil, nil
+	}
+	lst, isList := e.val.(*list)
+	if !isList {
+		return nil, ErrWrongType
+	}
+	items := lst.items
+	n := int64(len(items))
+	want := count
+	if want < 0 {
+		want = 1
+	}
+	var matched []int64
+	var compared int64
+	var rev int64
+	if rank < 0 {
+		rev = -rank
+	}
+	for i := int64(0); i < n; i++ {
+		idx := i
+		if rank < 0 {
+			idx = n - 1 - i // 反向：下标从尾往前
+		}
+		if maxLen > 0 && compared >= maxLen {
+			break
+		}
+		compared++
+		if items[idx] != elem {
+			continue
+		}
+		if rev > 0 {
+			rev-- // 跳过前 |rank|-1 个匹配
+			if rev > 0 {
+				continue
+			}
+		} else if rank > 1 {
+			rank--
+			continue
+		}
+		matched = append(matched, idx)
+		if int64(len(matched)) >= want {
+			break
+		}
+	}
+	return matched, nil
 }
 
 // -------- hash commands --------

@@ -11,6 +11,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":6379", "listen address, e.g. :6379")
 	aofPath := flag.String("aof", "", "append-only file for persistence (e.g. appendonly.aof); empty = in-memory only")
+	appendfsync := flag.String("appendfsync", "everysec", "AOF fsync policy: always (sync per write) | everysec (background 1s flusher, ~1s loss window) | no (OS decides)")
 	rdbPath := flag.String("rdb", "", "RDB snapshot file (e.g. dump.rdb); loaded at startup, written by SAVE/BGSAVE")
 	replicaof := flag.String("replicaof", "", "attach as replica to this master at startup (host:port)")
 	flag.Parse()
@@ -24,7 +25,9 @@ func main() {
 			log.Fatalf("server error: %v", err)
 		}
 		defer s.Close()
-		log.Printf("redis-go listening on %s (aof: %q, rdb: %q)", *addr, *aofPath, *rdbPath)
+		s.ConfigureAOF(*appendfsync) // AOF 未启用时为 no-op
+		log.Printf("redis-go listening on %s (aof: %q, appendfsync: %s, rdb: %q)",
+			*addr, *aofPath, *appendfsync, *rdbPath)
 	} else {
 		s = server.New()
 		log.Printf("redis-go listening on %s (in-memory, no persistence)", *addr)

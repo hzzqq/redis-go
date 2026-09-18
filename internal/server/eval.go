@@ -231,6 +231,7 @@ func (ec *evalCtx) callFunc(isCall bool) func(*lua.LState) int {
 		name := strings.ToUpper(parts[0])
 
 		var reply resp.Value
+		var setPre bool
 		switch {
 		case scriptBlocklist[name]:
 			reply = resp.Value{Type: resp.Error,
@@ -238,11 +239,12 @@ func (ec *evalCtx) callFunc(isCall bool) func(*lua.LState) int {
 		case isWriteCmd(v) && ec.s.isReplica():
 			reply = readonlyErr()
 		default:
+			setPre = ec.s.setPreState(v)
 			reply = ec.s.dispatch(v)
 		}
 		// 成功写命令 → canonical 效果帧（与 AOF/传播同一确定化路径）
 		if isWriteCmd(v) && reply.Type != resp.Error {
-			if c, ok := canonicalWrite(v, reply); ok {
+			if c, ok := canonicalWrite(v, reply, setPre); ok {
 				ec.effects = append(ec.effects, c)
 			}
 		}

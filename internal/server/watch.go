@@ -113,6 +113,11 @@ func writeCmdKeys(name string, args []resp.Value) []string {
 			keys = append(keys, args[i].Str)
 		}
 		return keys
+	case "LMOVE": // 改动源和目标两个 key
+		if len(args) >= 4 {
+			return []string{args[0].Str, args[3].Str}
+		}
+		return nil
 	case "DEL", "MGET":
 		keys := make([]string, 0, len(args))
 		for _, a := range args {
