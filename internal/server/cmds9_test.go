@@ -492,3 +492,36 @@ func TestAOFsyncReporting(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestConfigSetAppendFsync 回归：CONFIG SET appendfsync 运行期切换（README Phase 9
+// 宣称能力，验收冒烟发现 CONFIG SET 仍回 Unsupported CONFIG parameter——server 层
+// 漏接线，persist 层 SetFsync 与 ConfigureAOF 能力齐备）。非法值由 ConfigureAOF
+// 回退 no；其他参数保持诚实拒绝（对齐 server_test.go 既有 CONFIG SET maxmemory 断言）。
+func TestConfigSetAppendFsync(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewWithAOF(filepath.Join(dir, "appendonly.aof"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got := s.dispatch(mkCmd("CONFIG", "SET", "appendfsync", "always")); got.Type != resp.SimpleString || got.Str != "OK" {
+		t.Fatalf("CONFIG SET appendfsync always: %v", got.Str)
+	}
+	if got := replyStrings(t, "CONFIG GET after set", s.dispatch(mkCmd("CONFIG", "GET", "appendfsync"))); len(got) != 2 || got[1] != "always" {
+		t.Fatalf("CONFIG GET appendfsync after SET: %v", got)
+	}
+	info := s.dispatch(mkCmd("INFO", "persistence"))
+	if !strings.Contains(info.Str, "aof_fsync:always") {
+		t.Fatalf("INFO missing aof_fsync:always: %q", info.Str)
+	}
+	// 非法值回退 no（ConfigureAOF 内置规则）
+	if got := s.dispatch(mkCmd("CONFIG", "SET", "appendfsync", "bogus")); got.Type != resp.SimpleString || got.Str != "OK" {
+		t.Fatalf("CONFIG SET appendfsync bogus: %v", got.Str)
+	}
+	if got := replyStrings(t, "CONFIG GET after bogus", s.dispatch(mkCmd("CONFIG", "GET", "appendfsync"))); len(got) != 2 || got[1] != "no" {
+		t.Fatalf("bogus must fall back to no: %v", got)
+	}
+	// 其他参数仍拒绝
+	wantErr(t, "CONFIG SET maxmemory", s.dispatch(mkCmd("CONFIG", "SET", "maxmemory", "100")),
+		"Unsupported CONFIG parameter")
+}

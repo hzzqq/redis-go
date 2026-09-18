@@ -1757,8 +1757,14 @@ func (s *Server) cmdConfig(args []resp.Value) resp.Value {
 		}
 		return bulkArray(nil)
 	case "SET":
-		if len(args) < 2 {
+		if len(args) != 3 {
 			return wrongArgs("config")
+		}
+		// appendfsync 是目前唯一运行期可变参数：复用 ConfigureAOF（内部对
+		// 非法值回退 no，并同步 persist 层 fsync 模式与 INFO/CONFIG 展示字段）。
+		if strings.ToLower(args[1].Str) == "appendfsync" {
+			s.ConfigureAOF(args[2].Str)
+			return resp.Value{Type: resp.SimpleString, Str: "OK"}
 		}
 		return resp.Value{Type: resp.Error,
 			Str: "ERR Unsupported CONFIG parameter: " + args[1].Str}
