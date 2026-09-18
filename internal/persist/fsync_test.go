@@ -137,3 +137,60 @@ func TestFsyncModeSwitchDataIntegrity(t *testing.T) {
 		}
 	}
 }
+
+// TestFsyncStallWatchdog everysec 停滞看门狗：刚切到 everysec（lastSync 已随
+// 启动刷新）不误报；模拟后台刷盘停滞（lastSync 拨回 31s 前）时主路径 Log 兜底
+// 同步并计数一次（INFO aof_fsync_stalls）；兜底后 lastSync 已刷新，紧接着的
+// Log 不再计数；显式 Sync 同样刷新时间戳。
+func TestFsyncStallWatchdog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	a, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.SetFsync("everysec")
+	// 启动即写：时间戳已随 SetFsync 刷新，不得误触发兜底
+	if err := a.Log(mkArr("SET", "boot", "1")); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Stalls(); n != 0 {
+		t.Fatalf("fresh everysec must not trip the watchdog, stalls=%d", n)
+	}
+	// 模拟停滞：最近成功 fsync 拨回 31s 前（首秒 ticker 尚未轮到，无竞态）
+	a.lastSync.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	if err := a.Log(mkArr("SET", "stall", "1")); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Stalls(); n != 1 {
+		t.Fatalf("stalled flusher must trip the watchdog once, stalls=%d", n)
+	}
+	// 兜底同步已刷新 lastSync：紧接着的 Log 不再计数
+	if err := a.Log(mkArr("SET", "ok", "1")); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Stalls(); n != 1 {
+		t.Fatalf("refreshed lastSync must suppress the watchdog, stalls=%d", n)
+	}
+	// 显式 Sync 同样刷新：再拨回过去后 Sync，Log 不触发
+	a.lastSync.Store(time.Now().Add(-31 * time.Second).UnixNano())
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Log(mkArr("SET", "ok2", "1")); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Stalls(); n != 1 {
+		t.Fatalf("explicit Sync must refresh lastSync, stalls=%d", n)
+	}
+	// 数据完整：4 条全在
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("expected 4 commands, got %d", len(got))
+	}
+}
