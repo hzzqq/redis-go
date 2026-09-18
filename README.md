@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 9）
+# redis-go · Go 复刻 Redis（Phase 10）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -72,6 +72,13 @@
 - **回归修复（单测驱动）**：`cmdLMove` 参数下标错位（args 不含命令名，却按下标 1/2 取方向词）——`LMOVE` 一律 syntax error 且 WATCH 触碰连带失效；`store.ListPos` MAXLEN 两段式实现绕过收集阶段限制——重写为单循环；`TestCanonicalWritePhase9` 误用 dispatch（纯执行不落盘）——写命令改走 apply。
 - **基准与对照（cmd/bench，Windows 本机 n=100k）**：无 AOF——SET 250.0k（c=50 p=1）/ GET 264.2k / GET **623.8k**（pipeline 16）/ EVAL 9.5k / EVALSHA 9.6k（c=20）/ CAS 25.9k（c=10）。AOF 对照：everysec SET 38.1k、always SET 963 ops/s（Windows 每次 fsync p50 52ms，凸显三档策略的实际代价）。**redis-benchmark 对照**：本机无 redis-server/redis-benchmark 可用（docker 守护进程损坏、WSL 不支持），对照表以同参数复测自基线替代，等价命令见下节。
 - **测试**：新增 27 个测试函数（store/cmds9_test.go 10 + server/cmds9_test.go 13 + persist/fsync_test.go 4），全量 build/vet/test 3 轮 + 83 断言 TCP 冒烟（SCAN 分页/MATCH/TYPE、SSCAN/HSCAN/ZSCAN、OBJECT、LMOVE 轮转跨 key、LINSERT、LPOS 选项、SET/EXPIRE 选项矩阵、everysec 重启回放、LMOVE/EXPIRE/SET NX GET 副本传播）。
+
+### Phase 10 — 阻塞弹出 + SORT + AOF 停滞看门狗（本提交）
+- **阻塞弹出（BLPOP/BRPOP/BRPOPLPUSH）**：每 key FIFO 等待者队列（`bwMu` 保护，锁序 applyMu → **bwMu** → watchMu），等待者**不持 applyMu 睡眠**；投喂统一收口在 logAndPropagate——apply、事务 EXEC、主库命令流、EVAL 效果四条路径共用，推送命令的 applyMu 临界区内原子产出「推送帧 + 确定性弹出帧」（LPUSH/RPUSH→LPOP/RPOP、BRPOPLPUSH→LMOVE RIGHT LEFT）落 AOF + 传播副本，**重放状态严格一致**。多 key 按序探测、小数秒 timeout（0=无限）、超时 BLPOP/BRPOP 回 null array `*-1`、BRPOPLPUSH 回 null bulk `$-1`。200ms 读探针检测断连，断连等待者 abort 不投喂（**元素不丢**）；投喂/超时/断连三方竞态由 bwMu 串行化先到先得（served/aborted 恰置位一次）。MULTI 内一律非阻塞立即执行（有元素弹出、无元素 null 槽位，Redis 同）；副本上按读执行（不回 READONLY）；脚本内禁用（纯读 SORT 放行、SORT STORE 拒绝）。
+- **SORT**：全选项 `BY/LIMIT/GET/ASC/DESC/ALPHA/STORE`——list/set/zset 源（set 取成员字典序快照、zset 取 rank 序，Redis 内部序不可移植取确定序）；数值序要求权重可解析为 double（BY 引用缺失按 0），ALPHA 按字符串（缺失按空串），等分以元素字典序 tiebreak、DESC 整体反转含 tiebreak；`BY nosort` 保原序（配合 GET 批量取值）；GET `#`/模式/缺失 null bulk，多 GET 扁平化，LIMIT 先于 GET 展开；STORE 结果覆写为 list（**空结果删 key 回 0**），走写路径（applyMu + canonicalFor 读回 dst 生成 RPUSH/DEL 确定化帧）、副本 READONLY、脚本内禁用。
+- **AOF everysec 停滞看门狗**：后台刷盘超 **30s** 未成功（goroutine 停滞/调度饥饿）时主路径 Log 兜底同步 fsync 并计数，`INFO persistence` 新增 `aof_fsync_stalls:`（对齐 Redis flushAppendOnlyFile 主线程兜底思路，阈值远大于 1s ticker、正常抖动永不触发）。修复 lastSync 零值缺陷：不初始化即 1970 年，everysec 启动后首条写入必误报兜底一次——SetFsync 启动刷盘时刷新时间戳。
+- **回归修复（单测驱动）**：`writeCmdKeys` 的 LMOVE 分支误取 args[3]（方向词）当 key，应为 args[1]（dst）——dst 上的 WATCH 永不 dirty、乐观锁失效。
+- **测试**：新增 18 个测试函数（blocking_test.go 10 + sort_test.go 7 + fsync 停滞看门狗 1），全量 build/vet/test 3 轮 + 33/33 TCP 冒烟（BLPOP 立即/阻塞唤醒/超时 null/多 key 顺序/BRPOPLPUSH、断连不死喂、MULTI 非阻塞、SORT 数值/DESC/ALPHA/LIMIT/GET null/BY hash/STORE 空删、INFO 停滞计数、AOF 重启回放含阻塞弹出帧序与 STORE 结果）。STREAM 类型明确推迟（核心命令面主干已齐）。
 
 ## 与 redis-cli 联调
 
@@ -158,6 +165,17 @@ redis-cli set k v nx get keepttl          # 组合选项；NX+XX / KEEPTTL+EX �
 redis-cli config get appendfsync          # everysec（默认）；CONFIG SET 运行期切换
 redis-cli info persistence | grep aof_fsync
 
+# ── 阻塞弹出 + SORT（Phase 10）──
+redis-cli blpop q 0                       # 阻塞；另一连接 lpush/rpush q 后立即回 1) "q" 2) "元素"
+redis-cli blpop k1 k2 0                   # 多 key 按序探测；超时（0.5s）回 (nil)（*-1）
+redis-cli brpoplpush src dst 0            # 尾弹 src 头推 dst；超时回 (nil)（$-1）
+redis-cli rpush nums 3 1 2
+redis-cli sort nums desc limit 1 2        # 1) "3"  2) "2"
+redis-cli sort mylist alpha get # get obj_*->name    # GET 展开，缺失回 (nil)
+redis-cli sort uid by user_*->rank get user_*->name  # BY hash 字段作权重
+redis-cli sort nums store out             # (integer) 3，结果写为 list；空结果删 key 回 0
+redis-cli info persistence | grep aof_fsync_stalls   # everysec 兜底同步计数
+
 # redis-benchmark 等价命令（本机无真实 Redis 可用时，用 cmd/bench 同参数复测自基线）：
 #   redis-benchmark -n 100000 -c 50 -t set,get
 #   redis-benchmark -n 100000 -c 50 -P 16 -t get
@@ -195,7 +213,9 @@ redis-cli ──TCP──▶ server.Listen
 
 **复制模型**：写命令在 `applyMu` 临界区内「执行 → canonical 化 → AOF 落盘 + 副本入队 + repl-backlog feed」一步完成；每条副本连接一个独立 writer goroutine 出站（队列积压超 256MB 断开）；副本断线重连先试 `PSYNC <replid> <offset>` 部分重同步（1 MiB 环形 backlog 续传增量，超出范围退化全量 RDB）；主库每秒 REPLCONF GETACK 收集副本进度（INFO 可观测）。锁序：`applyMu → replMu → link.mu`。
 
-## 下一步（Phase 10）
+**阻塞弹出模型（Phase 10）**：每 key FIFO 等待者队列（bwMu）；推送命令在 applyMu 临界区内经 logAndPropagate → serveWaitersFrames 投喂，产出「推送帧 + 确定性弹出帧」一并落盘传播；等待者以 200ms 读探针探活，断连/超时即 abort 不投喂。锁序：`applyMu → bwMu → watchMu`。
+
+## 下一步（Phase 11）
 
 - [x] 主从复制（全量 RDB 同步 + 命令流传播、级联、REPLICAOF/READONLY/INFO replication）
 - [x] WATCH/UNWATCH 乐观锁、部分重同步（repl-backlog + PSYNC CONTINUE + REPLCONF ACK）、Lua 脚本（EVAL/EVALSHA/SCRIPT）
@@ -204,8 +224,11 @@ redis-cli ──TCP──▶ server.Listen
 - [x] appendfsync everysec（后台 fsync + 崩溃丢失窗口语义）
 - [x] EXPIRE NX/XX/GT/LT 选项、SET 选项矩阵收尾、OBJECT ENCODING
 - [x] redis-benchmark 对照基线（真实 Redis 不可用，以同参数复测自基线 + 等价命令文档化替代）
+- [x] 阻塞命令 BLPOP/BRPOP/BRPOPLPUSH（FIFO 等待者队列 + 投喂收口 logAndPropagate + 断连探针）
+- [x] SORT 全选项（BY/GET/LIMIT/ASC/DESC/ALPHA/STORE）
+- [x] AOF everysec 30s 停滞看门狗（主路径兜底 fsync + INFO aof_fsync_stalls）
 
-可选后续：阻塞命令（BLPOP/BRPOP/BRPOPLPUSH）、SORT 命令、STREAM 类型、AOF everysec 的 30s 兜底 fsync（Redis fsync 停滞保护）、真实 Redis 同机对照（待可用环境）。
+可选后续：STREAM 类型（XADD/XREAD/XRANGE 等独立大阶段）、真实 Redis 同机对照（待可用环境）、Lua state 池化等性能打磨、CONFIG 体系扩展。
 
 ## 测试与验收
 
@@ -221,3 +244,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-18：Phase 7 主从复制：全量测试 3 轮通过（新增 replication_test.go 7 用例 + rdb 字节级 round-trip）+ 32/32 双实例 TCP 冒烟（五类型 + TTL 传播、事务块传播、SPOP 确定化、杀副本重启重同步、杀主库重启重连、REPLICAOF NO ONE 晋升）；冒烟另暴露并修复 3 处回归（见 Phase 7 章节）。
 - 2026-09-18：Phase 8 WATCH 乐观锁 + 部分重同步（repl-backlog/PSYNC CONTINUE/REPLCONF ACK）+ Lua 脚本（EVAL/EVALSHA/SCRIPT 效果复制）+ bench 扩展（EVAL/EVALSHA/CAS）：全量测试 3 轮通过（新增 eval_test.go 8 用例 + psync_test.go 4 用例）+ 双实例 TCP 冒烟（五类型 + TTL 传播、EVAL 效果传播与重启恢复、WATCH 中止/UNWATCH 恢复、SCRIPT 族、部分重同步主/副日志断言、副本重启走全量、ACK offset 收敛）；冒烟另暴露 EXEC 乐观锁中止回复应为 `*-1` null array（原为 `$-1`，已修 resp 编码器并更新回归测试）。
 - 2026-09-18：Phase 9 SCAN/SSCAN/HSCAN/ZSCAN 游标族 + LMOVE/LINSERT/LPOS + appendfsync always/everysec/no + EXPIRE NX/XX/GT/LT + SET NX/XX/GET/KEEPTTL 收尾 + OBJECT ENCODING：全量测试 3 轮通过（新增 27 个测试函数）+ 83 断言 TCP 冒烟（SCAN 分页/MATCH/TYPE、三集合 SSCAN、OBJECT、LMOVE 轮转/跨 key、LPOS 选项、SET/EXPIRE 选项矩阵、everysec 重启回放、副本传播）。单测另暴露并修复 2 处缺陷：cmdLMove 参数下标错位（LMOVE 全体 syntax error + WATCH 触碰连带失效）、canonicalWrite 把 `SET NX GET` 新 key 成功（旧值 null）误判为 NX 失败不落盘（重启丢 key，dispatch 前 key 存在性快照消歧，5 调用点统一）。基准复测：无 AOF SET 250k/GET-p16 624k/EVAL 9.5k/CAS 25.9k ops/s；AOF everysec 38.1k、always 963 ops/s（Windows fsync p50 52ms）。
+- 2026-09-18：Phase 10 阻塞弹出（BLPOP/BRPOP/BRPOPLPUSH）+ SORT 全选项 + AOF everysec 30s 停滞看门狗：全量测试 3 轮通过（新增 18 个测试函数）+ 33/33 TCP 冒烟（阻塞唤醒/超时 null/多 key 顺序/断连不死喂/MULTI 非阻塞、SORT 数值/DESC/ALPHA/LIMIT/GET null/BY hash/STORE 空删、INFO aof_fsync_stalls、AOF 重启回放含阻塞弹出帧序）。单测暴露并修复 2 处缺陷：everysec 启动 lastSync 零值（1970）误报兜底一次（SetFsync 启动刷盘时刷新时间戳）、writeCmdKeys 的 LMOVE 误取方向词当 dst（WATCH 乐观锁对 dst 失效）。
