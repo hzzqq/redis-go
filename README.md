@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 5）
+# redis-go · Go 复刻 Redis（Phase 6）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -40,6 +40,14 @@
 - **实现机制**：hub 为 `map[channel]map[*client]struct{}`；每条连接一把出站写锁，命令回复与跨连接推送共用，保证 RESP 帧原子交错不损坏。
 - **性能基线（`cmd/bench`，Windows 本机 n=100000 c=50）**：SET 24.8k ops/s（p50 2.0ms，瓶颈在 AOF 落盘）；GET 132k ops/s（p1）/ **252k ops/s**（pipeline 16，p50 0.13ms）。工具支持 `-n/-c/-pipeline/-size`，输出吞吐 + p50/p90/p99/max。
 
+### Phase 6 — 事务 + RDB 快照 + 范围族（`9892632`/`292accc`）
+- **MULTI/EXEC/DISCARD 事务**：连接级状态机——MULTI 后命令排队回 `+QUEUED`，EXEC 一次性执行并把全部结果合成数组。语义对齐 Redis：**队列期错误**（未知命令/参数个数，`cmdArity` 单表校验 ~74 命令）立即报错并污染事务，EXEC 变 `EXECABORT`（队列整体丢弃、一条不执行）；**执行期错误**（WRONGTYPE、非整数等）只占据 EXEC 结果数组的对应槽位，其余命令照常生效。MULTI/EXEC/DISCARD/QUIT 不入队（嵌套 MULTI 报错不污染；QUIT 清事务后断连）；SUBSCRIBE/UNSUBSCRIBE 事务内拒绝且不污染。
+- **事务原子性**：整块在 `applyMu` 下执行，相对其他连接的写命令原子（与单写命令同一保证）；AOF 以 `MULTI...EXEC` 块一次落盘（失败命令跳过，与 apply 同策略），回放按块感知——**崩溃留下的未闭合块整体丢弃**（等价于事务未发生），空事务不落盘。
+- **RDB 快照**：`internal/persist/rdb.go` 自研二进制格式（9B magic `REDIS0059` + payload + **CRC64/ECMA 校验**；注：自研格式，非 Redis 字节级兼容）——每 key 记录类型/k/TTL + 类型化 body，五类型全覆盖。`SaveRDB` 以 tmp+fsync+**rename 原子替换**；`SAVE` 同步（回复到达即完成）、`BGSAVE` 后台 goroutine 立即回复；启动加载 **先 RDB 后 AOF**（双开时 AOF 状态优先，对齐 Redis），CRC 不符/截断/坏 magic **拒启**（对齐 Redis 对损坏 RDB 的态度）。快照用单次读锁导出——RDB 文件自洽、不与既有日志组合，无需 applyMu。
+- **范围族**：`ZRANGEBYSCORE`/`ZREVRANGEBYSCORE`（`-inf`/`+inf`/`(` 排他 + `LIMIT offset count` + `WITHSCORES`，rev 形态第一个参数是 max）与 `ZRANGEBYLEX`/`ZREVRANGEBYLEX`（`-`/`+`/`[m`/`(m` 边界）。跳表新增 `lastInRange`/`lastInLexRange`（镜像 first 的层间下降条件 + backward 链回走），反向遍历同为 O(log n) 起步。
+- **批量与随机**：`MGET`（missing 与 wrong-type 均回 null，单次读锁）、`MSET`（单次写锁覆写任意类型，AOF 原样落盘）、`ZRANDMEMBER key [count [WITHSCORES]]`（正数 distinct / 负数可重复 / 缺 key 单形态 null）。
+- **回归修复**：applyConn 事务化重写时丢失了非订阅模式的 SUBSCRIBE/UNSUBSCRIBE/PUBLISH 路由（PUBLISH 补进 dispatch，事务内亦可执行）——TCP 全量测试暴露并修复。
+
 ## 与 redis-cli 联调
 
 ```bash
@@ -47,6 +55,7 @@
 go build -o redis-go .
 ./redis-go -addr :6379 &                    # 纯内存模式
 ./redis-go -addr :6379 -aof appendonly.aof  # AOF 持久化模式
+./redis-go -addr :6379 -rdb dump.rdb        # RDB 快照模式（启动加载 + SAVE/BGSAVE 落盘）
 
 redis-cli ping                       # PONG
 redis-cli set foo bar ex 10
@@ -70,6 +79,20 @@ redis-cli subscribe news             # 进入订阅模式，收 [message, news, 
 # 另一个终端：
 redis-cli publish news hello         # (integer) 1，订阅端实时收到 "hello"
 redis-cli bgrewriteaof               # AOF 重写：每 key 一条 canonical 命令
+redis-cli multi                      # OK，进入事务
+redis-cli                            # 交互式逐条排队：
+#  set t1 x   → QUEUED
+#  incr ctr   → QUEUED
+#  exec       # 1) OK  2) (integer) 1 —— 结果合成数组
+redis-cli mset k1 v1 k2 v2           # OK
+redis-cli mget k1 k2 missing         # 1) "v1" 2) "v2" 3) (nil)
+redis-cli zadd lb 1 a 2 b 3 c
+redis-cli zrangebyscore lb (1 3 withscores   # b/c/d 及其分数
+redis-cli zrangebyscore lb -inf +inf limit 1 2
+redis-cli zrevrangebyscore lb 3 2            # 降序：c b
+redis-cli zrangebylex lb - +                 # 同分场景按成员字典序
+redis-cli zrandmember lb 2 withscores
+redis-cli bgsave                     # Background saving started（后台写 dump.rdb）
 ```
 
 重启后数据仍在（AOF 模式）：`foo`、列表、哈希全部回放，TTL 按真实流逝时间继续衰减。
@@ -97,15 +120,12 @@ redis-cli ──TCP──▶ server.Listen
 
 **并发模型**：写锁内原地变更，读锁内拷贝一切逃逸数据（string 天然不可变，slice/map 显式拷贝）；过期 key 写路径懒删除、读路径视作缺失（1s 周期清扫兜底物理删除）。
 
-## 下一步（Phase 6+）
+## 下一步（Phase 7）
 
-- [x] Set / ZSet 数据结构
-- [x] `CONFIG GET/SET`、`INFO`、`DBSIZE`
-- [x] AOF 重写（rewrite，压缩文件体积）
-- [x] pub/sub 基础
-- [x] 性能基线（自研 `cmd/bench`：SET 24.8k / GET 252k ops/s @ pipeline 16）
-- [ ] ZRANGEBYSCORE / ZRANGEBYLEX、ZRANDMEMBER、批量命令（MGET/MSET）
-- [ ] MULTI/EXEC 事务、RDB 快照、主从复制
+- [x] MULTI/EXEC/DISCARD 事务、RDB 快照（SAVE/BGSAVE + 启动加载）
+- [x] ZRANGEBYSCORE / ZRANGEBYLEX 族、ZRANDMEMBER、批量命令（MGET/MSET）
+- [ ] 主从复制（全量 RDB 同步 + 命令流传播）
+- [ ] WATCH/UNWATCH（事务乐观锁，可选）
 
 ## 测试与验收
 
@@ -117,3 +137,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-18：Phase 1/2 在 Go 1.22.5 实机验收通过（修 3 处缺陷，`c7e7e29`）；Phase 3 实机开发 + 全量测试通过 + 真实 TCP 冒烟（写入→杀进程→重启→状态回放一致，TTL 300s→288s 按真实时间衰减）。
 - 2026-09-18：Phase 3.5（`50f4d5b`，Set 基础 + 运维命令）；Phase 4（`92817ee`）跳表 ZSet + Set 补差 + SPOP 重写，全量测试 + 25/25 TCP 冒烟（含重启回放后 SPOP 成员不复活）。
 - 2026-09-18：Phase 5（`75211cd`+`c247c8d`+`c974934`）AOF 重写 + pub/sub + 压测基线；全量测试 3 轮通过 + 25/25 TCP 冒烟（重写压缩 468→255B、重启回放一致、pub/sub 不落盘、二次重启 DBSIZE=8）。
+- 2026-09-18：Phase 6（`9892632`+`292accc`）MULTI/EXEC 事务 + RDB 快照 + ZRANGEBYSCORE 族 + MGET/MSET/ZRANDMEMBER；全量测试 3 轮通过 + 34/34 TCP 冒烟（EXECABORT 不执行、RDB 重启回放含 TTL、CRC 损坏拒启、事务 AOF 块重启一致）。
