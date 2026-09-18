@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 4）
+# redis-go · Go 复刻 Redis（Phase 5）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -33,6 +33,13 @@
 - **SPOP AOF 重写**：随机命令不能原样回放——落盘时按**实际弹出的成员**改写为 `SREM key m1 m2...`；什么都没弹出则不落盘。回放后状态与原库严格一致（TCP 冒烟实测）。
 - **正确性验证**：2000 次随机插入（含大量同分 tiebreak 与覆盖更新）+ 随机删半，逐步与排序参照实现逐项对照（顺序遍历 / 每成员排名 / ZREVRANK / 按排名取元素）。
 
+### Phase 5 — AOF 重写 + pub/sub + 性能基线（本提交）
+- **AOF 重写（`BGREWRITEAOF`）**：`store.Snapshot()` 单次读锁导出最小 canonical 命令集——每 key 恰好一条命令（string→`SET [PXAT]`、list→`RPUSH` 全量、hash→`HSET` 插入序、set→`SADD` 排序、zset→`ZADD` 跳表序），跳过已过期 key；`persist.AOF.Rewrite()` 以 tmp+fsync+**rename 原子替换**（Windows 先关旧句柄再改名，改名失败自动重开旧文件兜底）。实测 468B 历史压到 255B，重启回放状态严格一致。
+- **重写并发安全**：写命令的 dispatch→落盘 区间由 `applyMu` 串行化（不变量：快照点不存在「已入库、未落盘」的命令，否则 RPUSH 会在快照+新日志中重复出现）；重写本身同步执行——回复到达时已完成（比 Redis 的异步语义更强）。读命令不加锁保持并发。
+- **pub/sub**：`SUBSCRIBE`（确认行 `[subscribe, ch, count]`，count 逐条递增，多频道逐帧下发）/ `UNSUBSCRIBE`（无参数退订全部，空退订回 null 频道行）/ `PUBLISH`（返回接收者数，`[message, channel, payload]` 推送帧）。订阅模式下拒绝其余命令（Redis 同文错误）、`PING` 回 `[pong, msg]` 数组；断连 defer 自动退订。消息广播**不落 AOF**（Redis 亦不传播）。
+- **实现机制**：hub 为 `map[channel]map[*client]struct{}`；每条连接一把出站写锁，命令回复与跨连接推送共用，保证 RESP 帧原子交错不损坏。
+- **性能基线（`cmd/bench`，Windows 本机 n=100000 c=50）**：SET 24.8k ops/s（p50 2.0ms，瓶颈在 AOF 落盘）；GET 132k ops/s（p1）/ **252k ops/s**（pipeline 16，p50 0.13ms）。工具支持 `-n/-c/-pipeline/-size`，输出吞吐 + p50/p90/p99/max。
+
 ## 与 redis-cli 联调
 
 ```bash
@@ -59,6 +66,10 @@ redis-cli zrank lb bob               # (integer) 0
 redis-cli zcount lb (8 +inf          # (integer) 1
 redis-cli type lb                    # zset
 redis-cli ttl foo                    # (integer) 9
+redis-cli subscribe news             # 进入订阅模式，收 [message, news, ...] 推送
+# 另一个终端：
+redis-cli publish news hello         # (integer) 1，订阅端实时收到 "hello"
+redis-cli bgrewriteaof               # AOF 重写：每 key 一条 canonical 命令
 ```
 
 重启后数据仍在（AOF 模式）：`foo`、列表、哈希全部回放，TTL 按真实流逝时间继续衰减。
@@ -86,14 +97,15 @@ redis-cli ──TCP──▶ server.Listen
 
 **并发模型**：写锁内原地变更，读锁内拷贝一切逃逸数据（string 天然不可变，slice/map 显式拷贝）；过期 key 写路径懒删除、读路径视作缺失（1s 周期清扫兜底物理删除）。
 
-## 下一步（Phase 5+）
+## 下一步（Phase 6+）
 
 - [x] Set / ZSet 数据结构
 - [x] `CONFIG GET/SET`、`INFO`、`DBSIZE`
-- [ ] AOF 重写（rewrite，压缩文件体积）
-- [ ] pub/sub 基础
-- [ ] 用 `redis-benchmark` 跑性能基线
+- [x] AOF 重写（rewrite，压缩文件体积）
+- [x] pub/sub 基础
+- [x] 性能基线（自研 `cmd/bench`：SET 24.8k / GET 252k ops/s @ pipeline 16）
 - [ ] ZRANGEBYSCORE / ZRANGEBYLEX、ZRANDMEMBER、批量命令（MGET/MSET）
+- [ ] MULTI/EXEC 事务、RDB 快照、主从复制
 
 ## 测试与验收
 
@@ -104,3 +116,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-16：Phase 1（`04340e4`）+ Phase 2 INCR 族（`6967088`）。
 - 2026-09-18：Phase 1/2 在 Go 1.22.5 实机验收通过（修 3 处缺陷，`c7e7e29`）；Phase 3 实机开发 + 全量测试通过 + 真实 TCP 冒烟（写入→杀进程→重启→状态回放一致，TTL 300s→288s 按真实时间衰减）。
 - 2026-09-18：Phase 3.5（`50f4d5b`，Set 基础 + 运维命令）；Phase 4（`92817ee`）跳表 ZSet + Set 补差 + SPOP 重写，全量测试 + 25/25 TCP 冒烟（含重启回放后 SPOP 成员不复活）。
+- 2026-09-18：Phase 5（`75211cd`+`c247c8d`+`c974934`）AOF 重写 + pub/sub + 压测基线；全量测试 3 轮通过 + 25/25 TCP 冒烟（重写压缩 468→255B、重启回放一致、pub/sub 不落盘、二次重启 DBSIZE=8）。
