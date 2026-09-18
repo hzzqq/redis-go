@@ -264,3 +264,60 @@ func TestBGSavesEventually(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestRDBAOFBothNoDoubleApply 回归：RDB 与 AOF 双开时数据源唯一取 AOF。
+// RDB 快照点必在 AOF 全量历史之内，"先载 RDB 再重放 AOF"会把快照前的
+// 非幂等命令（RPUSH/LPUSH/INCR/APPEND...）执行两遍（验收实测 list 元素
+// 重复 [x,x]）；AOF 开启时必须跳过 RDB 加载。
+func TestRDBAOFBothNoDoubleApply(t *testing.T) {
+	dir := t.TempDir()
+	rdbPath := filepath.Join(dir, "dump.rdb")
+	aofPath := filepath.Join(dir, "appendonly.aof")
+
+	s1, err := NewWithPersist(rdbPath, aofPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 写命令走 apply（真实写路径：dispatch + AOF 落盘）；dispatch 只改内存不落盘
+	s1.apply(mkCmd("RPUSH", "l", "a", "b"))
+	s1.apply(mkCmd("SET", "s", "x"))
+	s1.apply(mkCmd("SET", "n", "10"))
+	s1.apply(mkCmd("INCR", "n"))
+	if got := s1.dispatch(mkCmd("SAVE")); got.Type == resp.Error {
+		t.Fatalf("SAVE: %s", got.Str)
+	}
+	// SAVE 之后的写只进 AOF（RDB 快照不含）
+	s1.apply(mkCmd("SET", "after", "yes"))
+	s1.Close()
+
+	s2, err := NewWithPersist(rdbPath, aofPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	// 非幂等命令不得因 RDB+AOF 叠加而重复执行
+	wantBulkArray(t, "l", s2.dispatch(mkCmd("LRANGE", "l", "0", "-1")), []string{"a", "b"})
+	wantBulk(t, "s", s2.dispatch(mkCmd("GET", "s")), "x")
+	wantBulk(t, "n", s2.dispatch(mkCmd("GET", "n")), "11")
+	wantBulk(t, "after", s2.dispatch(mkCmd("GET", "after")), "yes")
+}
+
+// TestRDBLoadsWithoutAOF 无 AOF 时 RDB 仍是有效启动数据源（修复不回归）。
+func TestRDBLoadsWithoutAOF(t *testing.T) {
+	dir := t.TempDir()
+	rdbPath := filepath.Join(dir, "dump.rdb")
+	s1, err := NewWithPersist(rdbPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.dispatch(mkCmd("RPUSH", "l", "only"))
+	wantSimple(t, "SAVE", s1.dispatch(mkCmd("SAVE")), "OK")
+	s1.Close()
+
+	s2, err := NewWithPersist(rdbPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	wantBulkArray(t, "l", s2.dispatch(mkCmd("LRANGE", "l", "0", "-1")), []string{"only"})
+}

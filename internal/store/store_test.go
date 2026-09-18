@@ -219,11 +219,16 @@ func TestListPushAndLen(t *testing.T) {
 	if err != nil || n != 4 {
 		t.Fatalf("LPUSH: expected (4,nil), got (%d,%v)", n, err)
 	}
+	// Redis 语义回归：多参数 LPUSH 依次头插，LPUSH l p q → [q p z a b c]
+	n, err = s.ListPush("l", true, "p", "q")
+	if err != nil || n != 6 {
+		t.Fatalf("multi-arg LPUSH: expected (6,nil), got (%d,%v)", n, err)
+	}
 	got, err := s.ListRange("l", 0, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"z", "a", "b", "c"}
+	want := []string{"q", "p", "z", "a", "b", "c"}
 	if len(got) != len(want) {
 		t.Fatalf("expected %v, got %v", want, got)
 	}
@@ -232,8 +237,8 @@ func TestListPushAndLen(t *testing.T) {
 			t.Fatalf("expected %v, got %v", want, got)
 		}
 	}
-	if n, _ := s.ListLen("l"); n != 4 {
-		t.Fatalf("expected len 4, got %d", n)
+	if n, _ := s.ListLen("l"); n != 6 {
+		t.Fatalf("expected len 6, got %d", n)
 	}
 }
 

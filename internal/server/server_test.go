@@ -248,6 +248,10 @@ func TestListCommands(t *testing.T) {
 	wantInt(t, "LPUSH", s.dispatch(mkCmd("LPUSH", "l", "z")), 4)
 	wantBulkArray(t, "LRANGE 0 -1", s.dispatch(mkCmd("LRANGE", "l", "0", "-1")),
 		[]string{"z", "a", "b", "c"})
+	// Redis 语义：多参数 LPUSH 依次头插（回归 Phase 7 冒烟发现）
+	wantInt(t, "LPUSH multi", s.dispatch(mkCmd("LPUSH", "lm", "p", "q")), 2)
+	wantBulkArray(t, "LRANGE lm", s.dispatch(mkCmd("LRANGE", "lm", "0", "-1")),
+		[]string{"q", "p"})
 	wantInt(t, "LLEN", s.dispatch(mkCmd("LLEN", "l")), 4)
 	wantBulk(t, "LINDEX 0", s.dispatch(mkCmd("LINDEX", "l", "0")), "z")
 	wantBulk(t, "LINDEX -1", s.dispatch(mkCmd("LINDEX", "l", "-1")), "c")
