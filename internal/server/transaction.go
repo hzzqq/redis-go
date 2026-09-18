@@ -35,10 +35,10 @@ var cmdArity = map[string][2]int{
 	"LPUSH": {2, -1}, "RPUSH": {2, -1}, "LPOP": {1, 2}, "RPOP": {1, 2},
 	"LLEN": {1, 1}, "LRANGE": {3, 3}, "LINDEX": {2, 2}, "LSET": {3, 3},
 	"LTRIM": {3, 3},
-	"HSET": {3, -1}, "HGET": {2, 2}, "HGETALL": {1, 1}, "HDEL": {2, -1},
+	"HSET":  {3, -1}, "HGET": {2, 2}, "HGETALL": {1, 1}, "HDEL": {2, -1},
 	"HLEN": {1, 1}, "HEXISTS": {2, 2}, "HKEYS": {1, 1}, "HVALS": {1, 1},
 	"HINCRBY": {3, 3},
-	"SADD": {2, -1}, "SREM": {2, -1}, "SISMEMBER": {2, 2}, "SMEMBERS": {1, 1},
+	"SADD":    {2, -1}, "SREM": {2, -1}, "SISMEMBER": {2, 2}, "SMEMBERS": {1, 1},
 	"SCARD": {1, 1}, "SPOP": {1, 2}, "SRANDMEMBER": {1, 2},
 	"SINTER": {1, -1}, "SUNION": {1, -1}, "SDIFF": {1, -1},
 	"ZADD": {3, -1}, "ZSCORE": {2, 2}, "ZINCRBY": {3, 3}, "ZCARD": {1, 1},
@@ -51,7 +51,9 @@ var cmdArity = map[string][2]int{
 	"BGREWRITEAOF": {0, 0}, "FLUSHALL": {0, 0},
 	"SAVE": {0, 0}, "BGSAVE": {0, 0},
 	"MULTI": {0, 0}, "EXEC": {0, 0}, "DISCARD": {0, 0},
+	"WATCH": {1, -1}, "UNWATCH": {0, 0},
 	"SUBSCRIBE": {1, -1}, "UNSUBSCRIBE": {0, -1}, "PUBLISH": {2, 2},
+	"EVAL": {2, -1}, "EVALSHA": {2, -1}, "SCRIPT": {1, -1},
 	"REPLICAOF": {2, 2}, "SLAVEOF": {2, 2}, "PSYNC": {2, 2}, "SYNC": {0, 0},
 	"REPLCONF": {2, -1},
 }
@@ -96,9 +98,15 @@ func (s *Server) queueForTxn(cl *client, cmd string, v resp.Value) resp.Value {
 // Redis); the remaining commands still run.
 func (s *Server) execTransaction(cl *client) resp.Value {
 	defer cl.resetTxn()
+	defer s.clearWatch(cl) // EXEC 结束（含 abort）一律取消 WATCH（Redis 同语义）
 	if cl.queueErr {
 		return resp.Value{Type: resp.Error,
 			Str: "EXECABORT Transaction discarded because of previous errors."}
+	}
+	// 乐观锁：WATCH 的任一 key 在 WATCH 之后被（其他连接/事务外的写）修改，
+	// 放弃整个队列返回 null array *-1（Redis 同语义，事务未发生、不落盘不传播）。
+	if cl.dirtyCAS {
+		return resp.Value{Type: resp.Array, Null: true}
 	}
 	if len(cl.queue) == 0 {
 		return resp.Value{Type: resp.Array, Arr: []resp.Value{}}
@@ -107,8 +115,17 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 	defer s.applyMu.Unlock()
 	replies := make([]resp.Value, 0, len(cl.queue))
 	var canon []resp.Value
+	var scriptEffects []resp.Value
 	for _, q := range cl.queue {
 		var r resp.Value
+		// EVAL/EVALSHA：脚本内跑、效果帧并入本事务的 MULTI...EXEC 块
+		if name, _ := firstCmd(q); name == "EVAL" || name == "EVALSHA" {
+			r, eff := s.evalExec(q)
+			replies = append(replies, r)
+			canon = append(canon, eff...)
+			scriptEffects = append(scriptEffects, eff...)
+			continue
+		}
 		if s.isReplica() && isWriteCmd(q) {
 			r = readonlyErr()
 		} else {
@@ -120,6 +137,15 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 			}
 		}
 		replies = append(replies, r)
+	}
+	// 事务内的写触碰其他连接的 WATCH（跳过自己：不能自己 abort 自己）
+	for _, q := range cl.queue {
+		if isWriteCmd(q) {
+			s.touchWatched(q, cl)
+		}
+	}
+	for _, e := range scriptEffects {
+		s.touchWatched(e, cl)
 	}
 	// AOF 开启时照旧落 MULTI...EXEC 块（全失败的事务也落空块，回放无副作用）；
 	// 纯传播（无 AOF）时仅在确有生效命令时才包块。

@@ -48,20 +48,44 @@ type Server struct {
 	subMu    sync.Mutex
 	channels map[string]map[*client]struct{} // channel → subscribed conns
 
-	// replication (Phase 7): replID is this server's 40-char run id; master
+	// replication (Phase 7/8): replID is this server's 40-char run id; master
 	// is non-nil while this instance is a replica; replicas holds the
 	// downstream replica links this server streams commands to. replMu guards
-	// master/replicas; lock order is applyMu → replMu → link.mu.
-	replID   string
-	replMu   sync.Mutex
-	master   *masterLink
-	replicas map[*client]*replicaLink
+	// master/replicas; lock order is applyMu → replMu → link.mu. backlog is
+	// the replication ring buffer backing partial resync (PSYNC offset): fed
+	// under applyMu (same critical section as the command commit), read under
+	// applyMu in handlePSYNC. masterOff is the global replication offset.
+	replID    string
+	replMu    sync.Mutex
+	master    *masterLink
+	replicas  map[*client]*replicaLink
+	backlog   *replBacklog
+	masterOff atomic.Int64
+
+	// upstream 保存最近一次主库同步的凭据（replMu 保护）：REPLICAOF NO ONE
+	// 晋升后保留，之后再挂回同一主库时据此发 PSYNC <id> <offset> 请求部分
+	// 重同步（对齐真实 Redis 的 replid 保留语义；指向其他主库时 run id 不
+	// 匹配自动退化全量）。实现见 replication.go。
+	upstreamID  string
+	upstreamOff int64
+
+	// WATCH optimistic-lock hub (Phase 8): key → clients watching it.
+	// watchMu guards the hub; lock order is applyMu → watchMu.
+	watchMu  sync.Mutex
+	watchers map[string]map[*client]struct{}
+
+	// Lua script cache (Phase 8): sha1 hex → source. scriptMu guards it; the
+	// cache is per-process memory and lost on restart (Redis same).
+	scriptMu sync.Mutex
+	scripts  map[string]string
 }
 
 // New returns a ready-to-serve in-memory Server.
 func New() *Server {
 	return &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
-		replicas: make(map[*client]*replicaLink), replID: newReplID()}
+		replicas: make(map[*client]*replicaLink), replID: newReplID(),
+		watchers: make(map[string]map[*client]struct{}), backlog: newReplBacklog(),
+		scripts: make(map[string]string)}
 }
 
 // NewWithAOF returns a Server backed by an append-only file at path.
@@ -82,7 +106,9 @@ func NewWithAOF(path string) (*Server, error) {
 // Corrupt RDB stays fatal (like Redis); AOF tolerates a truncated tail.
 func NewWithPersist(rdbPath, aofPath string) (*Server, error) {
 	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
-		rdbPath: rdbPath, replicas: make(map[*client]*replicaLink), replID: newReplID()}
+		rdbPath: rdbPath, replicas: make(map[*client]*replicaLink), replID: newReplID(),
+		watchers: make(map[string]map[*client]struct{}), backlog: newReplBacklog(),
+		scripts: make(map[string]string)}
 	if rdbPath != "" && aofPath == "" {
 		entries, err := persist.LoadRDB(rdbPath)
 		if err != nil {
@@ -118,6 +144,7 @@ func (s *Server) Close() error {
 
 // Listen accepts connections on addr (e.g. ":6379") until an error occurs.
 func (s *Server) Listen(addr string) error {
+	go s.ackLoop() // REPLCONF ACK 心跳：由 Listen 启动，随进程存活
 	s.addr = addr
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -152,9 +179,13 @@ type client struct {
 	queueErr bool         // a queue-time error poisoned the transaction
 
 	// replication-link state (set once by PSYNC, read by handle/dropClient)
-	replPort     string        // announced by REPLCONF listening-port
-	replicaMode  bool          // upgraded to replica: handle() suppresses replies
-	replicaLink  *replicaLink  // this connection's master-side link (nil otherwise)
+	replPort    string       // announced by REPLCONF listening-port
+	replicaMode bool         // upgraded to replica: handle() suppresses replies
+	replicaLink *replicaLink // this connection's master-side link (nil otherwise)
+
+	// WATCH state (touched by this connection's handle goroutine + writers)
+	watchKeys map[string]struct{} // keys this connection watches
+	dirtyCAS  bool                // a watched key changed → EXEC must abort
 }
 
 // write serializes one reply/push onto the connection.
@@ -246,11 +277,20 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 			return resp.Value{Type: resp.Error, Str: "ERR DISCARD without MULTI"}
 		}
 		cl.resetTxn()
+		s.clearWatch(cl) // Redis 同语义：DISCARD 一并取消 WATCH
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
 	case "QUIT":
 		// QUIT 不入队：清掉未执行的事务后立即生效（Redis 同语义）
 		cl.resetTxn()
+		s.clearWatch(cl)
 		return s.apply(v)
+	case "WATCH":
+		if cl.inMulti {
+			return watchCmdError()
+		}
+		return s.cmdWatch(cl, v.Arr[1:])
+	case "UNWATCH":
+		return s.cmdUnwatch(cl)
 	}
 	if cl.inMulti {
 		return s.queueForTxn(cl, cmd, v)
@@ -266,7 +306,9 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 	case "REPLCONF":
 		return s.handleReplConf(cl, v.Arr[1:])
 	case "PSYNC", "SYNC":
-		return s.handlePSYNC(cl)
+		return s.handlePSYNC(cl, v.Arr[1:])
+	case "EVAL", "EVALSHA", "SCRIPT":
+		return s.cmdEval(cmd, v.Arr[1:])
 	}
 	return s.apply(v)
 }
@@ -408,6 +450,7 @@ func (s *Server) dropClient(cl *client) {
 	if cl.replicaLink != nil {
 		s.removeReplica(cl.replicaLink)
 	}
+	s.clearWatch(cl)
 	s.subMu.Lock()
 	defer s.subMu.Unlock()
 	for ch := range cl.chans {
@@ -446,6 +489,9 @@ func (s *Server) apply(v resp.Value) resp.Value {
 		if canon, ok := canonicalWrite(v, reply); ok {
 			frames = append(frames, canon)
 		}
+		// 写命令提交后触碰 WATCH 了这些 key 的连接（乐观锁 CAS 标记）。
+		// 缺 key 的 DEL 也会触碰（偏保守：只多 abort 不漏 abort）。
+		s.touchWatched(v, nil)
 	}
 	if err := s.logAndPropagate(frames); err != nil {
 		return resp.Value{Type: resp.Error, Str: "ERR AOF write error: " + err.Error()}
@@ -474,7 +520,7 @@ var writeCmds = map[string]bool{
 	"HSET": true, "HDEL": true, "HINCRBY": true,
 	"SADD": true, "SREM": true, "SPOP": true,
 	"ZADD": true, "ZINCRBY": true, "ZREM": true,
-	"MSET": true,
+	"MSET":     true,
 	"FLUSHALL": true,
 }
 

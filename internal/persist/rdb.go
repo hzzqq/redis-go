@@ -9,6 +9,7 @@
 //	uint64 crc                   8 bytes (CRC64/ECMA-182 of payloadLen || payload)
 //
 // Payload is a sequence of records, one per key:
+//
 //	uint8 kind          0=string 1=list 2=hash 3=set 4=zset
 //	uint64 keyLen + key
 //	uint64 ttlMs        0 = no TTL, else absolute ms epoch

@@ -5,7 +5,7 @@ import (
 )
 
 // zsetup 建一个带同分 tiebreak 的 zset：a=1, b=2, c=2, d=3, e=3
-//（同分内按成员字典序：b<c, d<e）。
+// （同分内按成员字典序：b<c, d<e）。
 func zsetup(t *testing.T) *Store {
 	t.Helper()
 	s := New()

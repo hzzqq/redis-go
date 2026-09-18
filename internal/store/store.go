@@ -199,7 +199,7 @@ func (s *Store) IncrBy(key string, delta int64) (int64, error) {
 	if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
 		return 0, errIncrementOverflow
 	}
-	e.val = strconv.FormatInt(cur + delta, 10)
+	e.val = strconv.FormatInt(cur+delta, 10)
 	s.m[key] = e
 	return cur + delta, nil
 }

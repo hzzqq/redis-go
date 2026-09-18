@@ -61,6 +61,10 @@ func WriteValue(w io.Writer, v Value) error {
 		}
 		return WriteBulk(w, v.Str)
 	case Array:
+		if v.Null {
+			// null array（*-1）：EXEC 中止等场景，与 null bulk（$-1）区分
+			return WriteArrayHeader(w, -1)
+		}
 		if err := WriteArrayHeader(w, len(v.Arr)); err != nil {
 			return err
 		}
