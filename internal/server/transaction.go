@@ -62,6 +62,9 @@ var cmdArity = map[string][2]int{
 	"LMOVE":  {4, 4}, "LINSERT": {4, 4}, "LPOS": {2, -1},
 	// Phase 10
 	"BLPOP": {2, -1}, "BRPOP": {2, -1}, "BRPOPLPUSH": {3, 3}, "SORT": {1, -1},
+	// Phase 11（stream）
+	"XADD": {4, -1}, "XLEN": {1, 1}, "XRANGE": {3, 3}, "XREVRANGE": {3, 3},
+	"XDEL": {2, -1}, "XTRIM": {3, -1}, "XREAD": {3, -1},
 }
 
 // resetTxn clears the connection's transaction state.
@@ -230,6 +233,11 @@ func (s *Server) applyExported(en store.Exported) {
 		}
 	case "zset":
 		s.store.ZAdd(en.Key, en.ZItems)
+		if !en.Expiry.IsZero() {
+			s.store.ExpireAt(en.Key, en.Expiry)
+		}
+	case "stream":
+		s.store.StreamRestore(en.Key, en.Stream)
 		if !en.Expiry.IsZero() {
 			s.store.ExpireAt(en.Key, en.Expiry)
 		}

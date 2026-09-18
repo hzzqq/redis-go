@@ -80,6 +80,12 @@ type Server struct {
 	bwMu   sync.Mutex
 	blockQ map[string][]*blockWaiter
 
+	// 流阻塞读等待者队列（Phase 11）：key → 等待者集合。xwMu 保护；锁序
+	// applyMu → xwMu。XREAD BLOCK 的唤醒发生在 XADD 提交的 applyMu 临界区
+	// （logAndPropagate → serveStreamWaiters），投喂为纯读快照、不产生帧。
+	xwMu    sync.Mutex
+	xblockQ map[string][]*streamWaiter
+
 	// Lua script cache (Phase 8): sha1 hex → source. scriptMu guards it; the
 	// cache is per-process memory and lost on restart (Redis same).
 	scriptMu sync.Mutex
@@ -96,7 +102,8 @@ func New() *Server {
 	return &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
 		replicas: make(map[*client]*replicaLink), replID: newReplID(),
 		watchers: make(map[string]map[*client]struct{}), backlog: newReplBacklog(),
-		scripts: make(map[string]string), blockQ: make(map[string][]*blockWaiter)}
+		scripts: make(map[string]string), blockQ: make(map[string][]*blockWaiter),
+		xblockQ: make(map[string][]*streamWaiter)}
 }
 
 // NewWithAOF returns a Server backed by an append-only file at path.
@@ -119,7 +126,8 @@ func NewWithPersist(rdbPath, aofPath string) (*Server, error) {
 	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{}),
 		rdbPath: rdbPath, replicas: make(map[*client]*replicaLink), replID: newReplID(),
 		watchers: make(map[string]map[*client]struct{}), backlog: newReplBacklog(),
-		scripts: make(map[string]string), blockQ: make(map[string][]*blockWaiter)}
+		scripts: make(map[string]string), blockQ: make(map[string][]*blockWaiter),
+		xblockQ: make(map[string][]*streamWaiter)}
 	if rdbPath != "" && aofPath == "" {
 		entries, err := persist.LoadRDB(rdbPath)
 		if err != nil {
@@ -323,6 +331,13 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 			return s.queueForTxn(cl, cmd, v)
 		}
 		return s.blockingPop(cl, cmd, v.Arr[1:])
+	case "XREAD":
+		// MULTI 内排队、EXEC 时非阻塞执行（Redis 同语义）；连接级带 BLOCK
+		// 走阻塞路径（cmdXReadConn 内分流）
+		if cl.inMulti {
+			return s.queueForTxn(cl, cmd, v)
+		}
+		return s.cmdXReadConn(cl, v.Arr[1:])
 	}
 	if cl.inMulti {
 		return s.queueForTxn(cl, cmd, v)
@@ -601,6 +616,9 @@ var writeCmds = map[string]bool{
 	"ZADD": true, "ZINCRBY": true, "ZREM": true,
 	"MSET":     true,
 	"FLUSHALL": true,
+	// Phase 11（stream）：XADD 自动 ID 经 canonicalWrite 定化为显式 ID；
+	// XDEL/XTRIM 本身确定，原样落盘。
+	"XADD": true, "XDEL": true, "XTRIM": true,
 }
 
 // canonicalWrite maps a successful write command to its persisted form.
@@ -744,6 +762,24 @@ func canonicalWrite(v, reply resp.Value, setPre bool) (resp.Value, bool) {
 				return v, true
 			}
 		}
+		return resp.Value{Type: resp.Array, Arr: out}, true
+	case "XADD":
+		// null 回复 = NOMKSTREAM 且 key 不存在：无状态变化，不落盘。
+		// 其余成功回复：把 id 参数（"*" 或显式）统一替换为回复中的解析后
+		// ID——自动 ID 以显式形态落盘/传播，重启/副本不漂移；修剪选项保留
+		// 原样（回放状态与执行时刻一致，修剪效果相同）。
+		if reply.Type == resp.BulkString && reply.Null {
+			return resp.Value{}, false
+		}
+		o, errv := xaddParse(args)
+		if errv.Type == resp.Error {
+			return v, true // 防御：成功回复时参数必合法，理论不达
+		}
+		optLen := len(args) - len(o.rest)
+		out := make([]resp.Value, 0, len(v.Arr))
+		out = append(out, v.Arr[:1+optLen]...) // 命令名 + 选项区
+		out = append(out, resp.Value{Type: resp.BulkString, Str: reply.Str})
+		out = append(out, o.rest[1:]...)
 		return resp.Value{Type: resp.Array, Arr: out}, true
 	default:
 		return v, true
@@ -1177,6 +1213,22 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdLPos(args)
 	case "PUBLISH":
 		return s.cmdPublish(args)
+	case "XADD":
+		return s.cmdXAdd(args)
+	case "XLEN":
+		return s.cmdXLen(args)
+	case "XRANGE":
+		return s.cmdXRange(args, false)
+	case "XREVRANGE":
+		return s.cmdXRange(args, true)
+	case "XDEL":
+		return s.cmdXDel(args)
+	case "XTRIM":
+		return s.cmdXTrim(args)
+	case "XREAD":
+		// dispatch 只做非阻塞形态（MULTI/EXEC 执行、回放兜底）；连接级
+		// BLOCK 路径在 applyConn 拦截
+		return s.cmdXRead(args)
 	case "REPLICAOF", "SLAVEOF":
 		return s.cmdReplicaOf(args)
 	case "FLUSHALL":

@@ -240,6 +240,10 @@ func (ec *evalCtx) callFunc(isCall bool) func(*lua.LState) int {
 		case scriptBlocklist[name]:
 			reply = resp.Value{Type: resp.Error,
 				Str: "ERR This Redis command is not allowed from script: " + name}
+		case name == "XREAD" && xreadHasBlock(parts[1:]):
+			// 带 BLOCK 的 XREAD 会阻塞脚本（Redis 同禁）；纯读 XREAD 放行
+			reply = resp.Value{Type: resp.Error,
+				Str: "ERR This Redis command is not allowed from script: XREAD BLOCK"}
 		case name == "SORT" && sortHasStore(parts[1:]):
 			// STORE 会写库且效果无法从脚本上下文确定性收集（读回时机受限），
 			// 脚本内禁用；纯读 SORT 放行

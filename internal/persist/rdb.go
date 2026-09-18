@@ -126,6 +126,8 @@ func appendRecord(buf []byte, e store.Exported) ([]byte, error) {
 		kind = 3
 	case "zset":
 		kind = 4
+	case "stream":
+		kind = 5
 	default:
 		return nil, fmt.Errorf("rdb: unknown kind %q", e.Kind)
 	}
@@ -162,6 +164,17 @@ func appendRecord(buf []byte, e store.Exported) ([]byte, error) {
 			binary.LittleEndian.PutUint64(fb[:], math.Float64bits(it.Score))
 			buf = append(buf, fb[:]...)
 			buf = appendString(buf, it.Member)
+		}
+	case "stream":
+		// 每条条目：ms、seq 各 8 字节 + 扁平字段数 + 字符串序列
+		buf = appendUint32(buf, uint32(len(e.Stream)))
+		for _, en := range e.Stream {
+			buf = appendUint64(buf, en.ID.MS)
+			buf = appendUint64(buf, en.ID.Seq)
+			buf = appendUint32(buf, uint32(len(en.Fields)))
+			for _, s := range en.Fields {
+				buf = appendString(buf, s)
+			}
 		}
 	}
 	return buf, nil
@@ -261,6 +274,8 @@ func decodeRecord(buf []byte) (store.Exported, []byte, error) {
 		e.Kind = "set"
 	case 4:
 		e.Kind = "zset"
+	case 5:
+		e.Kind = "stream"
 	default:
 		return store.Exported{}, nil, fmt.Errorf("rdb: unknown kind byte %d", kind)
 	}
@@ -347,6 +362,40 @@ func decodeRecord(buf []byte) (store.Exported, []byte, error) {
 				return store.Exported{}, nil, err
 			}
 			e.ZItems = append(e.ZItems, store.ZItem{Member: m, Score: score})
+		}
+	case "stream":
+		var n uint32
+		n, buf, err = readUint32(buf)
+		if err != nil {
+			return store.Exported{}, nil, err
+		}
+		e.Stream = make([]store.StreamEntry, 0, n)
+		for i := uint32(0); i < n; i++ {
+			var ms, seq uint64
+			ms, buf, err = readUint64(buf)
+			if err != nil {
+				return store.Exported{}, nil, err
+			}
+			seq, buf, err = readUint64(buf)
+			if err != nil {
+				return store.Exported{}, nil, err
+			}
+			var nf uint32
+			nf, buf, err = readUint32(buf)
+			if err != nil {
+				return store.Exported{}, nil, err
+			}
+			en := store.StreamEntry{ID: store.StreamID{MS: ms, Seq: seq},
+				Fields: make([]string, 0, nf)}
+			for j := uint32(0); j < nf; j++ {
+				var s string
+				s, buf, err = readString(buf)
+				if err != nil {
+					return store.Exported{}, nil, err
+				}
+				en.Fields = append(en.Fields, s)
+			}
+			e.Stream = append(e.Stream, en)
 		}
 	}
 	if err != nil {

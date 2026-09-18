@@ -387,6 +387,8 @@ func typeName(v any) string {
 		return "set"
 	case *zsetVal:
 		return "zset"
+	case *streamVal:
+		return "stream"
 	default:
 		return "none"
 	}
@@ -473,6 +475,11 @@ func (s *Store) Encoding(key string) (string, bool) {
 			return "listpack", true
 		}
 		return "skiplist", true
+	case *streamVal:
+		// Redis 对 stream 报告的编码名就是 "stream"（radix tree + listpack
+		// 的组合在 OBJECT ENCODING 里统一呈现为该名）；我们同样是映射而非
+		// 真实编码。
+		return "stream", true
 	default:
 		return "", false
 	}
@@ -556,6 +563,15 @@ func (s *Store) Snapshot() [][]string {
 				cmd = append(cmd, formatZScore(it.Score), it.Member)
 			}
 			out = append(out, cmd)
+		case *streamVal:
+			// 流：每条条目一条显式 ID 的 XADD（XADD 一次只加一条；显式 ID
+			// 重放严格递增，与原写入序一致）。last 随条目重放自然恢复。
+			for _, en := range v.entries {
+				cmd := make([]string, 0, 3+len(en.Fields))
+				cmd = append(cmd, "XADD", k, en.ID.String())
+				cmd = append(cmd, en.Fields...)
+				out = append(out, cmd)
+			}
 		}
 	}
 	return out
@@ -1436,12 +1452,13 @@ func (s *Store) MSet(pairs [][2]string) {
 type Exported struct {
 	Key    string
 	Expiry time.Time // zero = no TTL
-	Kind   string    // "string" | "list" | "hash" | "set" | "zset"
+	Kind   string    // "string" | "list" | "hash" | "set" | "zset" | "stream"
 	Str    string
 	List   []string
 	Hash   [][2]string
 	Set    []string // sorted for deterministic output
 	ZItems []ZItem  // skip-list order (score asc, member asc)
+	Stream []StreamEntry
 }
 
 // Export returns every live key as a typed snapshot for RDB saving (expired
@@ -1480,6 +1497,9 @@ func (s *Store) Export() []Exported {
 		case *zsetVal:
 			en.Kind = "zset"
 			en.ZItems = v.sl.items()
+		case *streamVal:
+			en.Kind = "stream"
+			en.Stream = append([]StreamEntry(nil), v.entries...)
 		}
 		out = append(out, en)
 	}

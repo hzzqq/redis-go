@@ -740,6 +740,9 @@ func (s *Server) logAndPropagate(frames []resp.Value) error {
 	if extra := s.serveWaitersFrames(frames); len(extra) > 0 {
 		frames = append(append([]resp.Value{}, frames...), extra...)
 	}
+	// Phase 11：流等待者投喂（XREAD BLOCK）。纯读快照、不产生确定性帧，
+	// 必须在 XADD 提交的同一 applyMu 临界区内完成（与注册路径成对消除空窗）。
+	s.serveStreamWaiters(frames)
 	var firstErr error
 	for _, f := range frames {
 		if s.aof != nil && firstErr == nil {
