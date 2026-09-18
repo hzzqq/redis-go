@@ -1,6 +1,7 @@
 package store
 
 import (
+	"sort"
 	"testing"
 	"time"
 )
@@ -513,5 +514,128 @@ func TestFlushKeepsSweeper(t *testing.T) {
 	s.Set("b", "2", 0)
 	if v, ok, _ := s.Get("b"); !ok || v != "2" {
 		t.Fatalf("expected (2,true), got (%q,%v)", v, ok)
+	}
+}
+
+// ---------------- Phase 3: Set ----------------
+
+func TestSetAddRemMembersCard(t *testing.T) {
+	s := New()
+	// 新集合添加 2 个成员
+	if n, err := s.SetAdd("s", []string{"a", "b"}); err != nil || n != 2 {
+		t.Fatalf("SADD new: expected (2,nil), got (%d,%v)", n, err)
+	}
+	// 重复成员只计一次
+	if n, _ := s.SetAdd("s", []string{"b", "c"}); n != 1 {
+		t.Fatalf("SADD dup: expected 1 added, got %d", n)
+	}
+	if ok, _ := s.SetIsMember("s", "a"); !ok {
+		t.Fatal("SISMEMBER a: expected true")
+	}
+	if ok, _ := s.SetIsMember("s", "zz"); ok {
+		t.Fatal("SISMEMBER zz: expected false")
+	}
+	// SMEMBERS 无序 → 排序后比较
+	members, err := s.SetMembers("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(members)
+	if len(members) != 3 || members[0] != "a" || members[1] != "b" || members[2] != "c" {
+		t.Fatalf("SMEMBERS: expected [a b c], got %v", members)
+	}
+	if n, _ := s.SetCard("s"); n != 3 {
+		t.Fatalf("SCARD: expected 3, got %d", n)
+	}
+	// SREM：删 1 存在 + 1 不存在 → 1
+	if n, _ := s.SetRem("s", []string{"a", "zz"}); n != 1 {
+		t.Fatalf("SREM: expected 1 removed, got %d", n)
+	}
+	// 删空 → key 删除
+	s.SetRem("s", []string{"b", "c"})
+	if s.Exists("s") {
+		t.Fatal("expected key deleted after removing all members")
+	}
+	// 缺失 key：card=0 / members 空 / sismember=false
+	if n, _ := s.SetCard("s"); n != 0 {
+		t.Fatalf("SCARD missing: expected 0, got %d", n)
+	}
+	if members, _ := s.SetMembers("s"); len(members) != 0 {
+		t.Fatalf("SMEMBERS missing: expected empty, got %v", members)
+	}
+	if ok, _ := s.SetIsMember("s", "a"); ok {
+		t.Fatal("SISMEMBER missing: expected false")
+	}
+}
+
+func TestSetWrongType(t *testing.T) {
+	s := New()
+	s.Set("k", "str", 0)
+	if _, err := s.SetAdd("k", []string{"v"}); err != ErrWrongType {
+		t.Fatalf("SADD on string: expected ErrWrongType, got %v", err)
+	}
+	s.SetAdd("s", []string{"a"})
+	if _, _, err := s.Get("s"); err != ErrWrongType {
+		t.Fatalf("GET on set: expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.Append("s", "x"); err != ErrWrongType {
+		t.Fatalf("APPEND on set: expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.IncrBy("s", 1); err != ErrWrongType {
+		t.Fatalf("INCRBY on set: expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.ListPush("s", false, "x"); err != ErrWrongType {
+		t.Fatalf("RPUSH on set: expected ErrWrongType, got %v", err)
+	}
+	if _, err := s.HashSet("s", [][2]string{{"f", "v"}}); err != ErrWrongType {
+		t.Fatalf("HSET on set: expected ErrWrongType, got %v", err)
+	}
+}
+
+func TestSetTTLPreserved(t *testing.T) {
+	s := New()
+	s.SetAdd("s", []string{"a"})
+	if !s.Expire("s", 1000*time.Millisecond) {
+		t.Fatal("expire should succeed")
+	}
+	if _, err := s.SetAdd("s", []string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	if rem, ok := s.TTL("s"); !ok || rem <= 0 {
+		t.Fatalf("TTL should be preserved after SetAdd, got rem=%d ok=%v", rem, ok)
+	}
+}
+
+// ---------------- Phase 3: Type / Stats / DBSize ----------------
+
+func TestTypeAndStats(t *testing.T) {
+	s := New()
+	if got := s.Type("nope"); got != "none" {
+		t.Fatalf("TYPE missing: expected none, got %q", got)
+	}
+	s.Set("k", "v", 0)
+	s.ListPush("l", false, "a")
+	s.HashSet("h", [][2]string{{"f", "v"}})
+	s.SetAdd("s", []string{"a"})
+	for key, want := range map[string]string{"k": "string", "l": "list", "h": "hash", "s": "set"} {
+		if got := s.Type(key); got != want {
+			t.Fatalf("TYPE %s: expected %s, got %s", key, want, got)
+		}
+	}
+	// Stats：4 个无 TTL + 1 个带 TTL
+	s.Set("t", "v", time.Hour)
+	keys, expires := s.Stats()
+	if keys != 5 || expires != 1 {
+		t.Fatalf("Stats: expected (5,1), got (%d,%d)", keys, expires)
+	}
+	if s.DBSize() != 5 {
+		t.Fatalf("DBSize: expected 5, got %d", s.DBSize())
+	}
+	// 过期键不计入 Stats/DBSize
+	s.Set("gone", "v", 1*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	keys, _ = s.Stats()
+	if keys != 5 {
+		t.Fatalf("Stats after expiry: expected 5, got %d", keys)
 	}
 }

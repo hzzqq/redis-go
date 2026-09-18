@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -468,4 +469,123 @@ func TestAOFTruncatedTail(t *testing.T) {
 	defer s2.Close()
 	wantBulk(t, "a survives truncation", s2.dispatch(mkCmd("GET", "a")), "1")
 	wantBulk(t, "b survives truncation", s2.dispatch(mkCmd("GET", "b")), "2")
+}
+
+// ---------------- Phase 3: Set ----------------
+
+// wantSimple 断言 reply 是 SimpleString 且 Str == expected。
+func wantSimple(t *testing.T, name string, reply resp.Value, expected string) {
+	t.Helper()
+	if reply.Type != resp.SimpleString || reply.Str != expected {
+		t.Fatalf("%s: expected +%s, got type=%c str=%q", name, expected, reply.Type, reply.Str)
+	}
+}
+
+func TestSetCommands(t *testing.T) {
+	s := New()
+	wantInt(t, "SADD 2", s.dispatch(mkCmd("SADD", "s", "a", "b")), 2)
+	wantInt(t, "SADD dup", s.dispatch(mkCmd("SADD", "s", "b", "c")), 1)
+	wantInt(t, "SISMEMBER yes", s.dispatch(mkCmd("SISMEMBER", "s", "a")), 1)
+	wantInt(t, "SISMEMBER no", s.dispatch(mkCmd("SISMEMBER", "s", "zz")), 0)
+	wantInt(t, "SCARD", s.dispatch(mkCmd("SCARD", "s")), 3)
+	// SMEMBERS 无序 → 排序后比较
+	reply := s.dispatch(mkCmd("SMEMBERS", "s"))
+	if reply.Type != resp.Array {
+		t.Fatalf("SMEMBERS: expected Array, got type=%c", reply.Type)
+	}
+	got := make([]string, 0, len(reply.Arr))
+	for _, it := range reply.Arr {
+		got = append(got, it.Str)
+	}
+	sort.Strings(got)
+	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
+		t.Fatalf("SMEMBERS: expected [a b c], got %v", got)
+	}
+	wantInt(t, "SREM", s.dispatch(mkCmd("SREM", "s", "a", "zz")), 1)
+	wantInt(t, "SREM empties set", s.dispatch(mkCmd("SREM", "s", "b", "c")), 2)
+	wantInt(t, "SCARD after purge", s.dispatch(mkCmd("SCARD", "s")), 0)
+	// 缺失 key
+	wantInt(t, "SCARD missing", s.dispatch(mkCmd("SCARD", "nope")), 0)
+	wantBulkArray(t, "SMEMBERS missing", s.dispatch(mkCmd("SMEMBERS", "nope")), []string{})
+	wantInt(t, "SISMEMBER missing", s.dispatch(mkCmd("SISMEMBER", "nope", "a")), 0)
+	// 参数错误
+	wantErr(t, "SADD too few", s.dispatch(mkCmd("SADD", "k")), "wrong number of arguments")
+	wantErr(t, "SREM too few", s.dispatch(mkCmd("SREM", "k")), "wrong number of arguments")
+}
+
+func TestSetWrongTypeDispatch(t *testing.T) {
+	s := New()
+	s.dispatch(mkCmd("SET", "k", "v"))
+	wantErr(t, "SADD on string", s.dispatch(mkCmd("SADD", "k", "x")), "WRONGTYPE")
+	s.dispatch(mkCmd("SADD", "s", "a"))
+	wantErr(t, "GET on set", s.dispatch(mkCmd("GET", "s")), "WRONGTYPE")
+	wantErr(t, "LPUSH on set", s.dispatch(mkCmd("LPUSH", "s", "x")), "WRONGTYPE")
+	wantErr(t, "HSET on set", s.dispatch(mkCmd("HSET", "s", "f", "v")), "WRONGTYPE")
+}
+
+// ---------------- Phase 3: TYPE / DBSIZE / INFO / CONFIG ----------------
+
+func TestTypeDispatch(t *testing.T) {
+	s := New()
+	s.dispatch(mkCmd("SET", "k", "v"))
+	s.dispatch(mkCmd("RPUSH", "l", "a"))
+	s.dispatch(mkCmd("HSET", "h", "f", "v"))
+	s.dispatch(mkCmd("SADD", "s", "a"))
+	wantSimple(t, "TYPE string", s.dispatch(mkCmd("TYPE", "k")), "string")
+	wantSimple(t, "TYPE list", s.dispatch(mkCmd("TYPE", "l")), "list")
+	wantSimple(t, "TYPE hash", s.dispatch(mkCmd("TYPE", "h")), "hash")
+	wantSimple(t, "TYPE set", s.dispatch(mkCmd("TYPE", "s")), "set")
+	wantSimple(t, "TYPE none", s.dispatch(mkCmd("TYPE", "nope")), "none")
+	wantErr(t, "TYPE arity", s.dispatch(mkCmd("TYPE")), "wrong number of arguments")
+}
+
+func TestDBSizeAndInfo(t *testing.T) {
+	s := New()
+	s.dispatch(mkCmd("SET", "a", "1"))
+	s.dispatch(mkCmd("SET", "b", "2", "EX", "1000"))
+	s.dispatch(mkCmd("RPUSH", "l", "x"))
+	wantInt(t, "DBSIZE", s.dispatch(mkCmd("DBSIZE")), 3)
+	wantErr(t, "DBSIZE arity", s.dispatch(mkCmd("DBSIZE", "x")), "wrong number of arguments")
+	// INFO 全量
+	info := s.dispatch(mkCmd("INFO"))
+	if info.Type != resp.BulkString {
+		t.Fatalf("INFO: expected BulkString, got type=%c", info.Type)
+	}
+	for _, want := range []string{
+		"# Server", "redis_version:redis-go-", "redis_mode:standalone",
+		"tcp_port:6379", "aof_enabled:0", "# Keyspace", "db0:keys=3,expires=1",
+	} {
+		if !strings.Contains(info.Str, want) {
+			t.Fatalf("INFO missing %q in:\n%s", want, info.Str)
+		}
+	}
+	// section 过滤
+	sec := s.dispatch(mkCmd("INFO", "keyspace"))
+	if !strings.Contains(sec.Str, "# Keyspace") || strings.Contains(sec.Str, "# Server") {
+		t.Fatalf("INFO keyspace section filter failed:\n%s", sec.Str)
+	}
+	if empty := s.dispatch(mkCmd("INFO", "bogus")); empty.Str != "" {
+		t.Fatalf("INFO bogus section: expected empty, got %q", empty.Str)
+	}
+}
+
+func TestConfigCommands(t *testing.T) {
+	s := New()
+	wantBulkArray(t, "CONFIG GET appendonly", s.dispatch(mkCmd("CONFIG", "GET", "appendonly")),
+		[]string{"appendonly", "no"})
+	wantBulkArray(t, "CONFIG GET maxmemory", s.dispatch(mkCmd("CONFIG", "GET", "maxmemory")),
+		[]string{"maxmemory", "0"})
+	wantBulkArray(t, "CONFIG GET unknown", s.dispatch(mkCmd("CONFIG", "GET", "bogus")), []string{})
+	wantErr(t, "CONFIG SET", s.dispatch(mkCmd("CONFIG", "SET", "maxmemory", "100")),
+		"Unsupported CONFIG parameter")
+	wantErr(t, "CONFIG bogus subcommand", s.dispatch(mkCmd("CONFIG", "BOGUS", "x")),
+		"Unknown subcommand")
+	// AOF 实例：appendonly 如实反映为 yes
+	s2, err := NewWithAOF(filepath.Join(t.TempDir(), "x.aof"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	wantBulkArray(t, "CONFIG GET appendonly (aof)", s2.dispatch(mkCmd("CONFIG", "GET", "appendonly")),
+		[]string{"appendonly", "yes"})
 }

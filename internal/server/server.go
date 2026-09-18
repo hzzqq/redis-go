@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ import (
 type Server struct {
 	store *store.Store
 	aof   *persist.AOF // nil = persistence disabled
+	addr  string       // listen address ("" until Listen is called)
 }
 
 // New returns a ready-to-serve in-memory Server.
@@ -58,6 +61,7 @@ func (s *Server) Close() error {
 
 // Listen accepts connections on addr (e.g. ":6379") until an error occurs.
 func (s *Server) Listen(addr string) error {
+	s.addr = addr
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -125,6 +129,7 @@ var writeCmds = map[string]bool{
 	"APPEND": true, "INCR": true, "DECR": true, "INCRBY": true,
 	"LPUSH": true, "RPUSH": true, "LPOP": true, "RPOP": true, "LSET": true, "LTRIM": true,
 	"HSET": true, "HDEL": true, "HINCRBY": true,
+	"SADD": true, "SREM": true,
 	"FLUSHALL": true,
 }
 
@@ -441,6 +446,54 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 			return errReply(err)
 		}
 		return resp.Value{Type: resp.Integer, Num: n}
+	case "SADD":
+		return s.cmdSetMembers(args, true)
+	case "SREM":
+		return s.cmdSetMembers(args, false)
+	case "SISMEMBER":
+		if len(args) != 2 {
+			return wrongArgs("sismember")
+		}
+		exists, err := s.store.SetIsMember(args[0].Str, args[1].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		if exists {
+			return resp.Value{Type: resp.Integer, Num: 1}
+		}
+		return resp.Value{Type: resp.Integer, Num: 0}
+	case "SMEMBERS":
+		if len(args) != 1 {
+			return wrongArgs("smembers")
+		}
+		members, err := s.store.SetMembers(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return bulkArray(members)
+	case "SCARD":
+		if len(args) != 1 {
+			return wrongArgs("scard")
+		}
+		n, err := s.store.SetCard(args[0].Str)
+		if err != nil {
+			return errReply(err)
+		}
+		return resp.Value{Type: resp.Integer, Num: n}
+	case "TYPE":
+		if len(args) != 1 {
+			return wrongArgs("type")
+		}
+		return resp.Value{Type: resp.SimpleString, Str: s.store.Type(args[0].Str)}
+	case "DBSIZE":
+		if len(args) != 0 {
+			return wrongArgs("dbsize")
+		}
+		return resp.Value{Type: resp.Integer, Num: s.store.DBSize()}
+	case "INFO":
+		return s.cmdInfo(args)
+	case "CONFIG":
+		return s.cmdConfig(args)
 	case "FLUSHALL":
 		s.store.Flush()
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
@@ -672,6 +725,143 @@ func wrongArgs(cmd string) resp.Value {
 
 func syntaxErr() resp.Value {
 	return resp.Value{Type: resp.Error, Str: "ERR syntax error"}
+}
+
+// cmdSetMembers handles SADD/SREM key member [member ...]: both return the
+// number of members actually added/removed.
+func (s *Server) cmdSetMembers(args []resp.Value, add bool) resp.Value {
+	name := "sadd"
+	if !add {
+		name = "srem"
+	}
+	if len(args) < 2 {
+		return wrongArgs(name)
+	}
+	members := fieldsOf(args[1:])
+	var n int64
+	var err error
+	if add {
+		n, err = s.store.SetAdd(args[0].Str, members)
+	} else {
+		n, err = s.store.SetRem(args[0].Str, members)
+	}
+	if err != nil {
+		return errReply(err)
+	}
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
+// infoSection is one block of the INFO reply (header line + fields + blank).
+type infoSection struct {
+	name string
+	body string
+}
+
+// cmdInfo handles INFO [section]. Without an argument all sections are
+// concatenated; with a section name only that block is returned (empty bulk
+// for an unknown section, like Redis).
+func (s *Server) cmdInfo(args []resp.Value) resp.Value {
+	sections := s.infoSections()
+	if len(args) > 0 {
+		for _, sec := range sections {
+			if strings.EqualFold(sec.name, args[0].Str) {
+				return resp.Value{Type: resp.BulkString, Str: sec.body}
+			}
+		}
+		return resp.Value{Type: resp.BulkString, Str: ""}
+	}
+	var b strings.Builder
+	for _, sec := range sections {
+		b.WriteString(sec.body)
+	}
+	return resp.Value{Type: resp.BulkString, Str: b.String()}
+}
+
+// infoSections builds the INFO blocks from live runtime state.
+func (s *Server) infoSections() []infoSection {
+	keys, expires := s.store.Stats()
+	aofEnabled := "0"
+	if s.aof != nil {
+		aofEnabled = "1"
+	}
+	server := "# Server\r\n" +
+		"redis_version:redis-go-0.3.0\r\n" +
+		"redis_mode:standalone\r\n" +
+		"os:" + runtime.GOOS + "\r\n" +
+		"go_version:" + runtime.Version() + "\r\n" +
+		"tcp_port:" + s.port() + "\r\n" +
+		fmt.Sprintf("process_id:%d\r\n", os.Getpid()) +
+		"\r\n"
+	persistence := "# Persistence\r\n" +
+		"aof_enabled:" + aofEnabled + "\r\n" +
+		"\r\n"
+	keyspace := "# Keyspace\r\n" +
+		fmt.Sprintf("db0:keys=%d,expires=%d\r\n", keys, expires)
+	return []infoSection{
+		{"Server", server},
+		{"Persistence", persistence},
+		{"Keyspace", keyspace},
+	}
+}
+
+// port extracts the TCP port from the listen address (default 6379).
+func (s *Server) port() string {
+	if s.addr == "" {
+		return "6379"
+	}
+	if _, p, err := net.SplitHostPort(s.addr); err == nil && p != "" {
+		return p
+	}
+	return s.addr
+}
+
+// cmdConfig handles CONFIG GET <param> with a small static registry
+// (appendonly reflects the actual AOF state). CONFIG SET is rejected honestly
+// because no option is runtime-mutable in redis-go yet. Unknown GET params
+// yield an empty array, like Redis.
+func (s *Server) cmdConfig(args []resp.Value) resp.Value {
+	if len(args) == 0 {
+		return wrongArgs("config")
+	}
+	switch strings.ToUpper(args[0].Str) {
+	case "GET":
+		if len(args) != 2 {
+			return wrongArgs("config")
+		}
+		name := strings.ToLower(args[1].Str)
+		switch name {
+		case "appendonly", "databases", "maxmemory", "save":
+			return bulkArray([]string{name, s.configValue(name)})
+		}
+		return bulkArray(nil)
+	case "SET":
+		if len(args) < 2 {
+			return wrongArgs("config")
+		}
+		return resp.Value{Type: resp.Error,
+			Str: "ERR Unsupported CONFIG parameter: " + args[1].Str}
+	default:
+		return resp.Value{Type: resp.Error, Str: fmt.Sprintf(
+			"ERR Unknown subcommand or wrong number of arguments for '%s'. Try CONFIG HELP.", args[0].Str)}
+	}
+}
+
+// configValue resolves the CONFIG GET registry (all static except appendonly).
+func (s *Server) configValue(name string) string {
+	switch name {
+	case "appendonly":
+		if s.aof != nil {
+			return "yes"
+		}
+		return "no"
+	case "databases":
+		return "16"
+	case "maxmemory":
+		return "0"
+	case "save":
+		return ""
+	}
+	return ""
 }
 
 // ensure io is used (kept for symmetry with future reader refactors)

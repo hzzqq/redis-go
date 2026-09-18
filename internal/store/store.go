@@ -8,10 +8,11 @@
 //     read paths only report them as missing (the background sweeper
 //     physically removes them within 1s).
 //
-// Value types: a key holds either a string, a list, or a hash. Operating on a
-// key with the wrong command family returns ErrWrongType, mirroring Redis.
-// Empty collections (list/hash with no elements left) delete the key, as in
-// Redis. SET always overwrites to a string regardless of the previous type.
+// Value types: a key holds either a string, a list, a hash, or a set.
+// Operating on a key with the wrong command family returns ErrWrongType,
+// mirroring Redis. Empty collections (list/hash/set with no elements left)
+// delete the key, as in Redis. SET always overwrites to a string regardless
+// of the previous type.
 package store
 
 import (
@@ -48,8 +49,13 @@ type hash struct {
 	m     map[string]string
 }
 
+// set is an unordered collection of unique strings.
+type set struct {
+	m map[string]struct{}
+}
+
 type entry struct {
-	val    any // string | *list | *hash
+	val    any // string | *list | *hash | *set
 	expiry time.Time
 }
 
@@ -273,6 +279,54 @@ func (s *Store) Len() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.m)
+}
+
+// Type returns the Redis type name of key: "none", "string", "list", "hash"
+// or "set" (TYPE command).
+func (s *Store) Type(key string) string {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return "none"
+	}
+	switch e.val.(type) {
+	case string:
+		return "string"
+	case *list:
+		return "list"
+	case *hash:
+		return "hash"
+	case *set:
+		return "set"
+	default:
+		return "none"
+	}
+}
+
+// Stats returns the number of live keys and how many of them carry a TTL
+// (used by DBSIZE and INFO). Expired-but-unswept entries are reported as
+// gone without being deleted; the background sweeper removes them.
+func (s *Store) Stats() (keys, expires int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	for _, e := range s.m {
+		if !e.expiry.IsZero() && now.After(e.expiry) {
+			continue
+		}
+		keys++
+		if !e.expiry.IsZero() {
+			expires++
+		}
+	}
+	return keys, expires
+}
+
+// DBSize returns the number of live keys (DBSIZE command).
+func (s *Store) DBSize() int64 {
+	keys, _ := s.Stats()
+	return keys
 }
 
 // -------- list commands --------
@@ -673,4 +727,113 @@ func (s *Store) HashIncrBy(key, field string, delta int64) (int64, error) {
 	e.val = h
 	s.m[key] = e
 	return cur + delta, nil
+}
+
+// -------- set commands --------
+
+// SetAdd adds members to the set at key (creating it if needed) and returns
+// the number of members actually added (duplicates count once).
+// ErrWrongType on a non-set key.
+func (s *Store) SetAdd(key string, members []string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := validLocked(s.m, key)
+	var st *set
+	if ok {
+		st, ok = e.val.(*set)
+		if !ok {
+			return 0, ErrWrongType
+		}
+	} else {
+		st = &set{m: make(map[string]struct{})}
+	}
+	var added int64
+	for _, m := range members {
+		if _, exists := st.m[m]; !exists {
+			st.m[m] = struct{}{}
+			added++
+		}
+	}
+	e.val = st
+	s.m[key] = e
+	return added, nil
+}
+
+// SetRem removes members from the set at key and returns how many were
+// removed. An emptied set deletes the key, as in Redis.
+func (s *Store) SetRem(key string, members []string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := validLocked(s.m, key)
+	if !ok {
+		return 0, nil
+	}
+	st, isSet := e.val.(*set)
+	if !isSet {
+		return 0, ErrWrongType
+	}
+	var removed int64
+	for _, m := range members {
+		if _, exists := st.m[m]; !exists {
+			continue
+		}
+		delete(st.m, m)
+		removed++
+	}
+	if len(st.m) == 0 {
+		delete(s.m, key)
+	}
+	return removed, nil
+}
+
+// SetIsMember reports whether member is in the set at key (false for a
+// missing key).
+func (s *Store) SetIsMember(key, member string) (bool, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return false, nil
+	}
+	st, isSet := e.val.(*set)
+	if !isSet {
+		return false, ErrWrongType
+	}
+	_, exists := st.m[member]
+	return exists, nil
+}
+
+// SetMembers returns all members of the set at key in unspecified order
+// (empty for a missing key), like Redis SMEMBERS.
+func (s *Store) SetMembers(key string) ([]string, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []string{}, nil
+	}
+	st, isSet := e.val.(*set)
+	if !isSet {
+		return nil, ErrWrongType
+	}
+	out := make([]string, 0, len(st.m))
+	for m := range st.m {
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// SetCard returns the cardinality of the set at key (0 if the key is missing).
+func (s *Store) SetCard(key string) (int64, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return 0, nil
+	}
+	st, isSet := e.val.(*set)
+	if !isSet {
+		return 0, ErrWrongType
+	}
+	return int64(len(st.m)), nil
 }
