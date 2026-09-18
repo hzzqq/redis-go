@@ -553,10 +553,18 @@ func (s *Server) replicationSection() string {
 	if s.master == nil {
 		b.WriteString("role:master\r\n")
 	} else {
-		b.WriteString("role:replica\r\n")
+		b.WriteString("role:slave\r\n")
 		fmt.Fprintf(&b, "master_host:%s\r\n", s.master.host)
 		fmt.Fprintf(&b, "master_port:%s\r\n", s.master.port)
-		fmt.Fprintf(&b, "master_link_status:%s\r\n", s.master.currentStatus())
+		// 对齐真实 Redis 字段值：仅命令流完全在线为 up，握手/全量同步期间为 down
+		// （内部 connect/sync/online 三态保留，只在 INFO 展示处映射）。
+		st := s.master.currentStatus()
+		if st == "online" {
+			st = "up"
+		} else {
+			st = "down"
+		}
+		fmt.Fprintf(&b, "master_link_status:%s\r\n", st)
 	}
 	// 下游视角：已挂载的副本（0 个也如实上报）
 	fmt.Fprintf(&b, "connected_slaves:%d\r\n", len(s.replicas))

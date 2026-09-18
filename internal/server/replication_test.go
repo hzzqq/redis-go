@@ -89,12 +89,12 @@ func attachReplica(t *testing.T, c net.Conn, r *resp.Reader, masterAddr string) 
 	})
 }
 
-// waitOnline 等待副本 INFO replication 显示 master_link_status:online。
+// waitOnline 等待副本 INFO replication 显示 master_link_status:up（INFO 输出对齐真实 Redis：up/down）。
 func waitOnline(t *testing.T, replicaAddr string) {
 	t.Helper()
 	waitUntil(t, "replica online", func() bool {
 		m := fetchInfo(t, replicaAddr, "replication")
-		return m["master_link_status"] == "online"
+		return m["master_link_status"] == "up"
 	})
 }
 
@@ -159,7 +159,7 @@ func TestReplicationFullSyncAndStream(t *testing.T) {
 
 	// 双端 INFO 角色与链路
 	m := fetchInfo(t, replicaAddr, "replication")
-	if m["role"] != "replica" || m["master_link_status"] != "online" {
+	if m["role"] != "slave" || m["master_link_status"] != "up" {
 		t.Fatalf("replica INFO: got %v", m)
 	}
 	if _, ok := m["master_port"]; !ok {
@@ -389,7 +389,7 @@ func TestReplicationCascade(t *testing.T) {
 	pollGet(t, "cascade C", cAddr, "deep", "v")
 
 	m := fetchInfo(t, bAddr, "replication")
-	if m["role"] != "replica" || m["connected_slaves"] != "1" {
+	if m["role"] != "slave" || m["connected_slaves"] != "1" {
 		t.Fatalf("middle INFO: got %v", m)
 	}
 }
