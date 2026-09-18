@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 6）
+# redis-go · Go 复刻 Redis（Phase 7）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -48,6 +48,14 @@
 - **批量与随机**：`MGET`（missing 与 wrong-type 均回 null，单次读锁）、`MSET`（单次写锁覆写任意类型，AOF 原样落盘）、`ZRANDMEMBER key [count [WITHSCORES]]`（正数 distinct / 负数可重复 / 缺 key 单形态 null）。
 - **回归修复**：applyConn 事务化重写时丢失了非订阅模式的 SUBSCRIBE/UNSUBSCRIBE/PUBLISH 路由（PUBLISH 补进 dispatch，事务内亦可执行）——TCP 全量测试暴露并修复。
 
+### Phase 7 — 主从复制（本提交）
+- **复制协议（对齐 Redis 2.6「断线即全量重同步」）**：副本 `REPLICAOF host port` → TCP 连主库 → `REPLCONF listening-port`/`capa`（主库一律 +OK）→ `PSYNC ? -1` → 主库回 `+FULLRESYNC <replid> 0`，随后把此刻全量 RDB 作为一个 RESP bulk 帧发送 → 副本 `Flush` + 逐条载入 → 之后串行回放命令流；连接断开则 2s 退避重连，重新全量同步。无部分重同步/backlog/ACK（有意简化：回环/局域网场景 TCP 错误即可探活）。
+- **传播挂点 = AOF 落盘点**：写命令的 `dispatch→canonical→log(AOF)+propagate(replicas)` 全在 `applyMu` 临界区内原子完成，同一份 canonical 形式（SPOP→SREM 确定化、相对 TTL→`PEXPIREAT` 绝对化）同时供 AOF 落盘与副本传播，状态天然一致。事务以 `MULTI...EXEC` 帧序列传播，副本端 `replay`/`applyMasterBlock` 同款块感知整体原子回放。
+- **快照/注册原子性**：`handlePSYNC` 在 `applyMu` 临界区内 `Export + EncodeRDB + 注册副本链路`——快照前的命令在 RDB、快照后的命令全传播，无丢失窗口。副本出站走独立 writer goroutine（临界区内只加锁入队，慢副本不拖写路径）；积压 >256MB 断开（对齐 `client-output-buffer-limit replica`）；副本连接升级后 `handle()` 回复一律静默。
+- **副本语义**：READONLY 拒写（Redis 同文错误；事务内写命令在 EXEC 槽位返回 READONLY 执行期错误）；`REPLICAOF NO ONE` 晋升为主库（数据保留）；拒绝复制到自身（防命令流自激死循环）；副本 AOF 基线重写——全量同步后立即把基线 `Snapshot→Rewrite` 进 AOF，重启后「基线+命令流」完整。级联复制（A←B←C）天然支持：中间节点两段 INFO 都输出。
+- **回归修复（冒烟驱动）**：① `handlePSYNC` 只注册 `s.replicas[cl]` 漏设 `cl.replicaLink`，导致副本断开后主库永不摘除链路（`dropClient` 依赖该字段）——补一行赋值并加回归测试；② `store.ListPush` 多参数头插顺序与 Redis 不符（`LPUSH l a b` 应得 `[b,a]` 而非 `[a,b]`）——改为逆序 append 并补 store/server 两层用例；③ `replicationSection` 对级联中间节点只走 replica 分支丢了 `connected_slaves`——重构为两段都输出。
+- **运维命令**：`REPLCONF`/`PSYNC`/`SYNC`（连接级处理）、`-replicaof host:port` 启动参数、`INFO replication`（role/master_host/master_port/master_link_status/connected_slaves/slaveN/master_replid）。
+
 ## 与 redis-cli 联调
 
 ```bash
@@ -93,6 +101,17 @@ redis-cli zrevrangebyscore lb 3 2            # 降序：c b
 redis-cli zrangebylex lb - +                 # 同分场景按成员字典序
 redis-cli zrandmember lb 2 withscores
 redis-cli bgsave                     # Background saving started（后台写 dump.rdb）
+
+# ── 主从复制（Phase 7）──
+./redis-go -addr :6380 -aof master.aof                       # 终端 1：主库
+./redis-go -addr :6381 -aof replica.aof -replicaof :6380     # 终端 2：副本（启动即挂载）
+redis-cli -p 6380 info replication      # role:master, connected_slaves:1
+redis-cli -p 6381 info replication      # role:replica, master_link_status:online
+redis-cli -p 6380 set k v               # 写主库
+redis-cli -p 6381 get k                 # "v" —— 命令流实时到达副本
+redis-cli -p 6381 set x y               # READONLY ...（副本拒写）
+redis-cli -p 6381 replicaof no one      # OK —— 晋升为主库，恢复可写
+# 杀掉副本重启（同参数）→ 自动重连 + 全量重同步；杀掉主库重启 → 副本 2s 退避重连
 ```
 
 重启后数据仍在（AOF 模式）：`foo`、列表、哈希全部回放，TTL 按真实流逝时间继续衰减。
@@ -120,12 +139,14 @@ redis-cli ──TCP──▶ server.Listen
 
 **并发模型**：写锁内原地变更，读锁内拷贝一切逃逸数据（string 天然不可变，slice/map 显式拷贝）；过期 key 写路径懒删除、读路径视作缺失（1s 周期清扫兜底物理删除）。
 
-## 下一步（Phase 7）
+**复制模型**：写命令在 `applyMu` 临界区内「执行 → canonical 化 → AOF 落盘 + 副本入队」一步完成；每条副本连接一个独立 writer goroutine 出站（队列积压超 256MB 断开）；副本端独立连接回放命令流（READONLY 门拦截本端写），断线 2s 退避重连即全量重同步。锁序：`applyMu → replMu → link.mu`。
 
-- [x] MULTI/EXEC/DISCARD 事务、RDB 快照（SAVE/BGSAVE + 启动加载）
-- [x] ZRANGEBYSCORE / ZRANGEBYLEX 族、ZRANDMEMBER、批量命令（MGET/MSET）
-- [ ] 主从复制（全量 RDB 同步 + 命令流传播）
+## 下一步（Phase 8）
+
+- [x] 主从复制（全量 RDB 同步 + 命令流传播、级联、REPLICAOF/READONLY/INFO replication）
 - [ ] WATCH/UNWATCH（事务乐观锁，可选）
+- [ ] 部分重同步（repl-backlog + PSYNC offset）与主从心跳 REPLCONF ACK
+- [ ] redis-benchmark 对照基线 / Lua 脚本（EVAL）
 
 ## 测试与验收
 
@@ -138,3 +159,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-18：Phase 3.5（`50f4d5b`，Set 基础 + 运维命令）；Phase 4（`92817ee`）跳表 ZSet + Set 补差 + SPOP 重写，全量测试 + 25/25 TCP 冒烟（含重启回放后 SPOP 成员不复活）。
 - 2026-09-18：Phase 5（`75211cd`+`c247c8d`+`c974934`）AOF 重写 + pub/sub + 压测基线；全量测试 3 轮通过 + 25/25 TCP 冒烟（重写压缩 468→255B、重启回放一致、pub/sub 不落盘、二次重启 DBSIZE=8）。
 - 2026-09-18：Phase 6（`9892632`+`292accc`）MULTI/EXEC 事务 + RDB 快照 + ZRANGEBYSCORE 族 + MGET/MSET/ZRANDMEMBER；全量测试 3 轮通过 + 34/34 TCP 冒烟（EXECABORT 不执行、RDB 重启回放含 TTL、CRC 损坏拒启、事务 AOF 块重启一致）。
+- 2026-09-18：Phase 7 主从复制：全量测试 3 轮通过（新增 replication_test.go 7 用例 + rdb 字节级 round-trip）+ 32/32 双实例 TCP 冒烟（五类型 + TTL 传播、事务块传播、SPOP 确定化、杀副本重启重同步、杀主库重启重连、REPLICAOF NO ONE 晋升）；冒烟另暴露并修复 3 处回归（见 Phase 7 章节）。
