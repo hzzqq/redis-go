@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hzzqq/redis-go/internal/persist"
@@ -27,17 +28,25 @@ type Server struct {
 	aof   *persist.AOF // nil = persistence disabled
 	addr  string       // listen address ("" until Listen is called)
 
+	// rdbPath enables RDB snapshots (SAVE/BGSAVE + startup load); empty = off.
+	rdbPath string
+	// rdbMu serializes SAVE/BGSAVE writers; lastSave is unix seconds of the
+	// last successful snapshot (INFO reporting).
+	rdbMu    sync.Mutex
+	lastSave atomic.Int64
+
 	// applyMu serializes the (dispatch → AOF-log) section of write commands.
 	// The invariant this protects: a write command's store commit and its AOF
 	// entry become visible atomically, so a concurrent BGREWRITEAOF snapshot
 	// can never see "committed but not yet logged" state (which would make
 	// the command appear both in the snapshot and in the post-rewrite log,
 	// e.g. duplicating an RPUSH after replay). Read commands bypass it.
+	// MULTI/EXEC also runs its whole block under this lock for atomicity.
 	applyMu sync.Mutex
 
 	// subMu guards the pub/sub hub below.
-	subMu     sync.Mutex
-	channels  map[string]map[*client]struct{} // channel → subscribed conns
+	subMu    sync.Mutex
+	channels map[string]map[*client]struct{} // channel → subscribed conns
 }
 
 // New returns a ready-to-serve in-memory Server.
@@ -50,19 +59,37 @@ func New() *Server {
 // commands parsed before the truncation point are applied), then the file is
 // reopened for appending.
 func NewWithAOF(path string) (*Server, error) {
-	cmds, err := persist.Load(path)
-	if err != nil {
-		log.Printf("warning: %v", err)
+	return NewWithPersist("", path)
+}
+
+// NewWithPersist loads an RDB snapshot (corrupt RDB is fatal, like Redis)
+// and replays the AOF (tolerating a truncated tail), then opens the AOF for
+// appending. Load order mirrors Redis: RDB first, AOF on top — so with both
+// enabled the AOF state wins.
+func NewWithPersist(rdbPath, aofPath string) (*Server, error) {
+	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{}), rdbPath: rdbPath}
+	if rdbPath != "" {
+		entries, err := persist.LoadRDB(rdbPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, en := range entries {
+			s.applyExported(en)
+		}
+		log.Printf("rdb: loaded %d keys from %s", len(entries), rdbPath)
 	}
-	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{})}
-	for _, v := range cmds {
-		s.dispatch(v)
+	if aofPath != "" {
+		cmds, err := persist.Load(aofPath)
+		if err != nil {
+			log.Printf("warning: %v", err)
+		}
+		s.replay(cmds)
+		a, err := persist.Open(aofPath)
+		if err != nil {
+			return nil, err
+		}
+		s.aof = a
 	}
-	a, err := persist.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	s.aof = a
 	return s, nil
 }
 
@@ -97,11 +124,16 @@ func (s *Server) Listen(addr string) error {
 // client is the per-connection state: one bufio writer guarded by writeMu
 // (command replies and pub/sub pushes interleave on the same socket, so every
 // write goes through here as one atomic WriteValue+Flush unit), plus the set
-// of channels this connection subscribes to.
+// of channels this connection subscribes to and the MULTI/EXEC transaction
+// state (touched only by this connection's handle goroutine).
 type client struct {
 	writeMu sync.Mutex
 	w       *bufio.Writer
 	chans   map[string]struct{}
+
+	inMulti  bool         // MULTI received, commands are being queued
+	queue    []resp.Value // commands queued since MULTI
+	queueErr bool         // a queue-time error poisoned the transaction
 }
 
 // write serializes one reply/push onto the connection.
@@ -134,48 +166,77 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-// applyConn layers connection-scoped semantics on top of apply: pub/sub
-// commands are handled per client, and while subscribed only subscription
-// commands, PING and QUIT are accepted (Redis subscribe-mode restriction).
+// applyConn layers connection-scoped semantics on top of apply: the pub/sub
+// subscribe-mode restriction, MULTI/EXEC transaction state, and per-client
+// subscription bookkeeping.
 func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 	cmd, ok := firstCmd(v)
 	if !ok {
 		return s.apply(v) // 非法协议形态保持原错误
 	}
-	args := v.Arr[1:]
 	subModeErr := func() resp.Value {
 		return resp.Value{Type: resp.Error, Str: fmt.Sprintf(
 			"ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
 			strings.ToLower(cmd))}
 	}
-	switch cmd {
-	case "SUBSCRIBE":
-		return cl.subscribe(s, args)
-	case "UNSUBSCRIBE":
-		return cl.unsubscribe(s, args)
-	case "PUBLISH":
-		if len(cl.chans) > 0 {
-			return subModeErr() // Redis 订阅模式下拒绝 PUBLISH
-		}
-		return s.cmdPublish(args)
-	case "PING":
-		if len(cl.chans) > 0 {
+	// 订阅模式：仅放行订阅族 / PING / QUIT（Redis 同限制，事务命令同样拒绝）
+	if len(cl.chans) > 0 {
+		switch cmd {
+		case "SUBSCRIBE":
+			return cl.subscribe(s, v.Arr[1:])
+		case "UNSUBSCRIBE":
+			return cl.unsubscribe(s, v.Arr[1:])
+		case "PING":
 			// 订阅模式下 PING 回复 [pong, <msg|"">] 数组（Redis 行为）
 			msg := ""
-			if len(args) > 0 {
-				msg = args[0].Str
+			if len(v.Arr) > 1 {
+				msg = v.Arr[1].Str
 			}
 			return resp.Value{Type: resp.Array, Arr: []resp.Value{
 				{Type: resp.SimpleString, Str: "PONG"},
 				{Type: resp.BulkString, Str: msg},
 			}}
-		}
-	case "QUIT":
-		// 交给 apply 返回 OK，handle 负责断开
-	default:
-		if len(cl.chans) > 0 {
+		case "QUIT":
+			// 交给 apply 返回 OK，handle 负责断开
+		default:
 			return subModeErr()
 		}
+		return s.apply(v)
+	}
+	// 事务状态机（订阅模式之外）
+	switch cmd {
+	case "MULTI":
+		if cl.inMulti {
+			return resp.Value{Type: resp.Error, Str: "ERR MULTI calls can not be nested"}
+		}
+		cl.inMulti = true
+		return resp.Value{Type: resp.SimpleString, Str: "OK"}
+	case "EXEC":
+		if !cl.inMulti {
+			return resp.Value{Type: resp.Error, Str: "ERR EXEC without MULTI"}
+		}
+		return s.execTransaction(cl)
+	case "DISCARD":
+		if !cl.inMulti {
+			return resp.Value{Type: resp.Error, Str: "ERR DISCARD without MULTI"}
+		}
+		cl.resetTxn()
+		return resp.Value{Type: resp.SimpleString, Str: "OK"}
+	case "QUIT":
+		// QUIT 不入队：清掉未执行的事务后立即生效（Redis 同语义）
+		cl.resetTxn()
+		return s.apply(v)
+	}
+	if cl.inMulti {
+		return s.queueForTxn(cl, cmd, v)
+	}
+	// 订阅命令需要 per-connection 状态（cl.chans），走连接层而非 dispatch；
+	// PUBLISH 无连接状态，经 apply→dispatch 执行（事务内同样可执行，Redis 同语义）。
+	switch cmd {
+	case "SUBSCRIBE":
+		return cl.subscribe(s, v.Arr[1:])
+	case "UNSUBSCRIBE":
+		return cl.unsubscribe(s, v.Arr[1:])
 	}
 	return s.apply(v)
 }
@@ -372,6 +433,7 @@ var writeCmds = map[string]bool{
 	"HSET": true, "HDEL": true, "HINCRBY": true,
 	"SADD": true, "SREM": true, "SPOP": true,
 	"ZADD": true, "ZINCRBY": true, "ZREM": true,
+	"MSET": true,
 	"FLUSHALL": true,
 }
 
@@ -807,6 +869,26 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdConfig(args)
 	case "BGREWRITEAOF":
 		return s.cmdBGRewriteAOF()
+	case "SAVE":
+		return s.cmdSave()
+	case "BGSAVE":
+		return s.cmdBGSave()
+	case "MGET":
+		return s.cmdMGet(args)
+	case "MSET":
+		return s.cmdMSet(args)
+	case "ZRANGEBYSCORE":
+		return s.cmdZRangeByScore(args, false)
+	case "ZREVRANGEBYSCORE":
+		return s.cmdZRangeByScore(args, true)
+	case "ZRANGEBYLEX":
+		return s.cmdZRangeByLex(args, false)
+	case "ZREVRANGEBYLEX":
+		return s.cmdZRangeByLex(args, true)
+	case "ZRANDMEMBER":
+		return s.cmdZRandMember(args)
+	case "PUBLISH":
+		return s.cmdPublish(args)
 	case "FLUSHALL":
 		s.store.Flush()
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
@@ -1345,14 +1427,20 @@ func (s *Server) infoSections() []infoSection {
 		aofEnabled = "1"
 	}
 	server := "# Server\r\n" +
-		"redis_version:redis-go-0.5.0\r\n" +
+		"redis_version:redis-go-0.6.0\r\n" +
 		"redis_mode:standalone\r\n" +
 		"os:" + runtime.GOOS + "\r\n" +
 		"go_version:" + runtime.Version() + "\r\n" +
 		"tcp_port:" + s.port() + "\r\n" +
 		fmt.Sprintf("process_id:%d\r\n", os.Getpid()) +
 		"\r\n"
+	rdbEnabled := "0"
+	if s.rdbPath != "" {
+		rdbEnabled = "1"
+	}
 	persistence := "# Persistence\r\n" +
+		"rdb_enabled:" + rdbEnabled + "\r\n" +
+		fmt.Sprintf("rdb_last_save_time:%d\r\n", s.lastSave.Load()) +
 		"aof_enabled:" + aofEnabled + "\r\n" +
 		"\r\n"
 	keyspace := "# Keyspace\r\n" +

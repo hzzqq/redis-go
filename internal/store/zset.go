@@ -7,6 +7,7 @@
 package store
 
 import (
+	"errors"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -546,5 +547,284 @@ func (s *Store) zsetItems(key string) []ZItem {
 // round-trips through ParseFloat (so replayed floats are bit-identical).
 func formatZScore(f float64) string {
 	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
+// -------- Phase 6: score/lex 范围遍历 + 随机成员 --------
+
+// lastInRange returns the last node with min <= score <= max, or nil. Mirror
+// of firstInRange: level-wise descent advancing while the forward node
+// satisfies max, which lands on the last node <= max.
+func (z *zskiplist) lastInRange(min, max zbound) *zslNode {
+	if !z.isInRange(min, max) {
+		return nil
+	}
+	x := z.head
+	for i := z.level - 1; i >= 0; i-- {
+		for x.level[i].forward != nil && valueLteMax(x.level[i].forward.score, max) {
+			x = x.level[i].forward
+		}
+	}
+	if x == z.head || !valueGteMin(x.score, min) {
+		return nil
+	}
+	return x
+}
+
+// zlexbound is one endpoint of a member (lex) range. inf: -1 = "-"（最小）、
+// +1 = "+"（最大）；ex 表示 "(" 排他边界（"[" 为包含）。
+type zlexbound struct {
+	value string
+	ex    bool
+	inf   int
+}
+
+// ParseZLexBound parses a ZRANGEBYLEX-style endpoint: "-", "+", "[member"
+// (inclusive), "(member" (exclusive).
+func ParseZLexBound(s string) (zlexbound, error) {
+	switch s {
+	case "-":
+		return zlexbound{inf: -1}, nil
+	case "+":
+		return zlexbound{inf: 1}, nil
+	}
+	if s == "" {
+		return zlexbound{}, errors.New("min or max not valid string range item")
+	}
+	switch s[0] {
+	case '[':
+		return zlexbound{value: s[1:]}, nil
+	case '(':
+		return zlexbound{value: s[1:], ex: true}, nil
+	}
+	return zlexbound{}, errors.New("min or max not valid string range item")
+}
+
+func lexGteMin(m string, b zlexbound) bool {
+	switch b.inf {
+	case -1:
+		return true
+	case 1:
+		return false
+	}
+	if b.ex {
+		return m > b.value
+	}
+	return m >= b.value
+}
+
+func lexLteMax(m string, b zlexbound) bool {
+	switch b.inf {
+	case 1:
+		return true
+	case -1:
+		return false
+	}
+	if b.ex {
+		return m < b.value
+	}
+	return m <= b.value
+}
+
+// firstInLexRange returns the first node whose member is in [min, max] (lex),
+// or nil. Lex ranges are only meaningful when all members share one score —
+// the same caveat as Redis ZRANGEBYLEX.
+func (z *zskiplist) firstInLexRange(min, max zlexbound) *zslNode {
+	x := z.head
+	for i := z.level - 1; i >= 0; i-- {
+		for x.level[i].forward != nil && !lexGteMin(x.level[i].forward.member, min) {
+			x = x.level[i].forward
+		}
+	}
+	x = x.level[0].forward
+	if x == nil || !lexLteMax(x.member, max) {
+		return nil
+	}
+	return x
+}
+
+// lastInLexRange returns the last node whose member is in [min, max] (lex),
+// or nil.
+func (z *zskiplist) lastInLexRange(min, max zlexbound) *zslNode {
+	x := z.head
+	for i := z.level - 1; i >= 0; i-- {
+		for x.level[i].forward != nil && lexLteMax(x.level[i].forward.member, max) {
+			x = x.level[i].forward
+		}
+	}
+	if x == z.head || !lexGteMin(x.member, min) {
+		return nil
+	}
+	return x
+}
+
+// ZRangeByScore returns members with min <= score <= max in ascending score
+// order, skipping the first `offset` matches and returning up to count
+// (count < 0 = unlimited, count == 0 = empty, like Redis LIMIT).
+func (s *Store) ZRangeByScore(key string, min, max zbound, offset, count int64) ([]ZItem, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []ZItem{}, nil
+	}
+	z, isZ := e.val.(*zsetVal)
+	if !isZ {
+		return nil, ErrWrongType
+	}
+	x := z.sl.firstInRange(min, max)
+	for ; x != nil && valueLteMax(x.score, max) && offset > 0; x = x.level[0].forward {
+		offset--
+	}
+	out := []ZItem{}
+	for ; x != nil && valueLteMax(x.score, max); x = x.level[0].forward {
+		if count == 0 {
+			break
+		}
+		out = append(out, ZItem{Member: x.member, Score: x.score})
+		if count > 0 {
+			count--
+		}
+	}
+	return out, nil
+}
+
+// ZRevRangeByScore is ZRangeByScore in descending score order.
+func (s *Store) ZRevRangeByScore(key string, min, max zbound, offset, count int64) ([]ZItem, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []ZItem{}, nil
+	}
+	z, isZ := e.val.(*zsetVal)
+	if !isZ {
+		return nil, ErrWrongType
+	}
+	x := z.sl.lastInRange(min, max)
+	for ; x != nil && valueGteMin(x.score, min) && offset > 0; x = x.backward {
+		offset--
+	}
+	out := []ZItem{}
+	for ; x != nil && valueGteMin(x.score, min); x = x.backward {
+		if count == 0 {
+			break
+		}
+		out = append(out, ZItem{Member: x.member, Score: x.score})
+		if count > 0 {
+			count--
+		}
+	}
+	return out, nil
+}
+
+// ZRangeByLex returns members whose member sorts inside [min, max] (lex), in
+// ascending member order, with the same offset/count semantics as
+// ZRangeByScore. Only meaningful when all members share one score.
+func (s *Store) ZRangeByLex(key string, min, max zlexbound, offset, count int64) ([]string, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []string{}, nil
+	}
+	z, isZ := e.val.(*zsetVal)
+	if !isZ {
+		return nil, ErrWrongType
+	}
+	x := z.sl.firstInLexRange(min, max)
+	out := []string{}
+	for ; x != nil && lexLteMax(x.member, max); x = x.level[0].forward {
+		if offset > 0 {
+			offset--
+			continue
+		}
+		if count == 0 {
+			break
+		}
+		out = append(out, x.member)
+		if count > 0 {
+			count--
+		}
+	}
+	return out, nil
+}
+
+// ZRevRangeByLex is ZRangeByLex in descending member order.
+func (s *Store) ZRevRangeByLex(key string, min, max zlexbound, offset, count int64) ([]string, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []string{}, nil
+	}
+	z, isZ := e.val.(*zsetVal)
+	if !isZ {
+		return nil, ErrWrongType
+	}
+	x := z.sl.lastInLexRange(min, max)
+	out := []string{}
+	for ; x != nil && lexGteMin(x.member, min); x = x.backward {
+		if offset > 0 {
+			offset--
+			continue
+		}
+		if count == 0 {
+			break
+		}
+		out = append(out, x.member)
+		if count > 0 {
+			count--
+		}
+	}
+	return out, nil
+}
+
+// ZRandMember returns random members without removing them. withCount
+// selects the count form: count > 0 → up to count DISTINCT members;
+// count < 0 → exactly |count| members with repetition allowed (Redis
+// semantics). Each item carries its score so the server can serve
+// WITHSCORES replies.
+func (s *Store) ZRandMember(key string, count int64, withCount bool) ([]ZItem, error) {
+	s.mu.RLock()
+	e, ok := validRO(s.m, key)
+	s.mu.RUnlock()
+	if !ok {
+		return []ZItem{}, nil
+	}
+	z, isZ := e.val.(*zsetVal)
+	if !isZ {
+		return nil, ErrWrongType
+	}
+	members := make([]string, 0, len(z.m))
+	for m := range z.m {
+		members = append(members, m)
+	}
+	if !withCount {
+		if len(members) == 0 {
+			return []ZItem{}, nil
+		}
+		m := members[rand.Intn(len(members))]
+		return []ZItem{{Member: m, Score: z.m[m]}}, nil
+	}
+	if count == 0 {
+		return []ZItem{}, nil
+	}
+	if count > 0 {
+		rand.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
+		if count > int64(len(members)) {
+			count = int64(len(members))
+		}
+		out := make([]ZItem, 0, count)
+		for _, m := range members[:count] {
+			out = append(out, ZItem{Member: m, Score: z.m[m]})
+		}
+		return out, nil
+	}
+	out := make([]ZItem, -count)
+	for i := range out {
+		m := members[rand.Intn(len(members))]
+		out[i] = ZItem{Member: m, Score: z.m[m]}
+	}
+	return out, nil
 }
 

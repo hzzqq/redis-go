@@ -1078,3 +1078,87 @@ func (s *Store) SetDiff(keys []string) ([]string, error) {
 	sort.Strings(out)
 	return out, nil
 }
+
+// -------- Phase 6: 批量命令 + RDB 导出 --------
+
+// MGet fetches several keys under one read-lock pass. Missing keys AND
+// wrong-type keys yield nil (Redis MGET replies nil instead of WRONGTYPE).
+func (s *Store) MGet(keys []string) []*string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*string, len(keys))
+	for i, k := range keys {
+		e, ok := validRO(s.m, k)
+		if !ok {
+			continue
+		}
+		if v, isStr := e.val.(string); isStr {
+			out[i] = &v
+		}
+	}
+	return out
+}
+
+// MSet stores every key/value pair, overwriting any previous type (Redis
+// MSET semantics). All pairs land under a single write lock.
+func (s *Store) MSet(pairs [][2]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range pairs {
+		s.m[p[0]] = entry{val: p[1]}
+	}
+}
+
+// Exported is one key's state in a neutral shape for RDB export.
+type Exported struct {
+	Key    string
+	Expiry time.Time // zero = no TTL
+	Kind   string    // "string" | "list" | "hash" | "set" | "zset"
+	Str    string
+	List   []string
+	Hash   [][2]string
+	Set    []string // sorted for deterministic output
+	ZItems []ZItem  // skip-list order (score asc, member asc)
+}
+
+// Export returns every live key as a typed snapshot for RDB saving (expired
+// entries are skipped). A single read-lock pass yields a consistent
+// point-in-time view, which is self-contained for an RDB file — unlike the
+// AOF rewrite snapshot, no coordination with an append log is needed.
+func (s *Store) Export() []Exported {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	out := make([]Exported, 0, len(s.m))
+	for k, e := range s.m {
+		if !e.expiry.IsZero() && now.After(e.expiry) {
+			continue
+		}
+		en := Exported{Key: k, Expiry: e.expiry}
+		switch v := e.val.(type) {
+		case string:
+			en.Kind, en.Str = "string", v
+		case *list:
+			en.Kind = "list"
+			en.List = append([]string(nil), v.items...)
+		case *hash:
+			en.Kind = "hash"
+			en.Hash = make([][2]string, 0, len(v.order))
+			for _, f := range v.order {
+				en.Hash = append(en.Hash, [2]string{f, v.m[f]})
+			}
+		case *set:
+			en.Kind = "set"
+			en.Set = make([]string, 0, len(v.m))
+			for m := range v.m {
+				en.Set = append(en.Set, m)
+			}
+			sort.Strings(en.Set)
+		case *zsetVal:
+			en.Kind = "zset"
+			en.ZItems = v.sl.items()
+		}
+		out = append(out, en)
+	}
+	return out
+}
