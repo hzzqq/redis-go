@@ -130,6 +130,14 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 			return resp.Value{Type: resp.Integer, Num: -1}
 		}
 		return resp.Value{Type: resp.Integer, Num: rem}
+	case "APPEND":
+		return s.cmdAppend(args)
+	case "INCR":
+		return s.cmdIncrBy(args, 1, "incr")
+	case "DECR":
+		return s.cmdIncrBy(args, -1, "decr")
+	case "INCRBY":
+		return s.cmdIncrByWithAmount(args, "incrby")
 	case "FLUSHALL":
 		s.store = store.New()
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
@@ -192,6 +200,43 @@ func (s *Server) cmdExpire(args []resp.Value) resp.Value {
 		return resp.Value{Type: resp.Integer, Num: 1}
 	}
 	return resp.Value{Type: resp.Integer, Num: 0}
+}
+
+// cmdAppend 处理 APPEND key value：返回拼接后的新长度（Integer）。
+func (s *Server) cmdAppend(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return wrongArgs("append")
+	}
+	n := s.store.Append(args[0].Str, args[1].Str)
+	return resp.Value{Type: resp.Integer, Num: n}
+}
+
+// cmdIncrBy 处理 INCR/DECR（固定 delta，无额外参数）。cmdName 用于错误消息。
+func (s *Server) cmdIncrBy(args []resp.Value, delta int64, cmdName string) resp.Value {
+	if len(args) != 1 {
+		return wrongArgs(cmdName)
+	}
+	v, err := s.store.IncrBy(args[0].Str, delta)
+	if err != nil {
+		return resp.Value{Type: resp.Error, Str: err.Error()}
+	}
+	return resp.Value{Type: resp.Integer, Num: v}
+}
+
+// cmdIncrByWithAmount 处理 INCRBY key increment：解析第二参数为 int64 后调用 IncrBy。
+func (s *Server) cmdIncrByWithAmount(args []resp.Value, cmdName string) resp.Value {
+	if len(args) != 2 {
+		return wrongArgs(cmdName)
+	}
+	delta, err := strconv.ParseInt(args[1].Str, 10, 64)
+	if err != nil {
+		return resp.Value{Type: resp.Error, Str: "ERR value is not an integer or out of range"}
+	}
+	v, err := s.store.IncrBy(args[0].Str, delta)
+	if err != nil {
+		return resp.Value{Type: resp.Error, Str: err.Error()}
+	}
+	return resp.Value{Type: resp.Integer, Num: v}
 }
 
 func wrongArgs(cmd string) resp.Value {

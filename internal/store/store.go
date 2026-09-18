@@ -2,9 +2,20 @@
 package store
 
 import (
+	"errors"
+	"math"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// 哨兵错误：INCR/DECR/INCRBY 遇到非整数值或溢出时返回。
+// 文本与 redis 的 "ERR value is not an integer or out of range" / "ERR increment or decrement would overflow" 对齐。
+var (
+	errIncrementNotInteger = errors.New("ERR value is not an integer or out of range")
+	errIncrementOverflow    = errors.New("ERR increment or decrement would overflow")
+)
+
 
 type entry struct {
 	value  string
@@ -128,6 +139,59 @@ func (s *Store) TTL(key string) (rem int64, exists bool) {
 	}
 	// 剩余秒数向上取整（Redis 语义：TTL 对不足 1 秒的剩余时间返回 1）
 	return int64((left + time.Second - 1) / time.Second), true
+}
+
+// Append 原子地把 val 拼到 key 末尾，返回拼接后的新长度。
+// 不存在的 key 视作空串。保留原 expiry（已过期/不存在则建立无 TTL 的新条目）。
+// 与 Redis 一致：APPEND 不会重置 TTL，但对已过期 key 会先惰性删除再建立新条目。
+func (s *Store) Append(key, val string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[key]
+	if !ok || (!e.expiry.IsZero() && time.Now().After(e.expiry)) {
+		// 不存在或已过期：建立新条目（无 TTL）
+		e = entry{value: val}
+	} else {
+		e.value = e.value + val
+		// 保留原 expiry（零值表示无 TTL）
+	}
+	s.m[key] = e
+	return int64(len(e.value))
+}
+
+// IncrBy 原子地把 key 的整数值加 delta，返回新值。
+//   - 不存在的 key 视作 0
+//   - 当前值非 base-10 整数（含空串）→ 返回错误，store 不变
+//   - 已过期的 key 视作不存在（惰性删除后建立新条目，无 TTL）
+//   - 整数溢出 int64 范围 → 返回 overflow 错误，store 不变
+//
+// DECR 等价于 IncrBy(key, -1)；INCR 等价于 IncrBy(key, 1)。
+func (s *Store) IncrBy(key string, delta int64) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[key]
+	missing := !ok || (!e.expiry.IsZero() && time.Now().After(e.expiry))
+	if missing {
+		// 不存在或已过期：视作 0，建立新条目（无 TTL）
+		e = entry{}
+	}
+	// 不存在的 key 视作 0；已存在的空串视为非法值（Redis 不允许 INCR 空 key）
+	if missing {
+		e.value = "0"
+	}
+	cur, err := strconv.ParseInt(e.value, 10, 64)
+	if err != nil {
+		return 0, errIncrementNotInteger
+	}
+	// 溢出检测：同号相加可能溢出
+	if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
+		return 0, errIncrementOverflow
+	}
+	newVal := cur + delta
+	// 保留原 expiry（零值表示无 TTL）
+	e.value = strconv.FormatInt(newVal, 10)
+	s.m[key] = e
+	return newVal, nil
 }
 
 // Len returns the current number of keys (approximate under concurrency).
