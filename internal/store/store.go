@@ -333,6 +333,64 @@ func (s *Store) DBSize() int64 {
 	return keys
 }
 
+// Snapshot exports every live key as a minimal canonical command set for AOF
+// rewrite: exactly one command per key — SET (with absolute PXAT when the key
+// carries a TTL), RPUSH (full list), HSET (insertion order), SADD (members
+// sorted) or ZADD (skip-list order, score asc) — skipping expired entries.
+// A single read-lock pass yields a consistent point-in-time view; map
+// iteration order is random but each key's command is self-contained, so the
+// set replays to the same state in any order.
+func (s *Store) Snapshot() [][]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now()
+	out := make([][]string, 0, len(s.m))
+	for k, e := range s.m {
+		if !e.expiry.IsZero() && now.After(e.expiry) {
+			continue // 已过期（尚未被清扫）的 key 不进快照
+		}
+		switch v := e.val.(type) {
+		case string:
+			cmd := []string{"SET", k, v}
+			if !e.expiry.IsZero() {
+				cmd = append(cmd, "PXAT", strconv.FormatInt(e.expiry.UnixMilli(), 10))
+			}
+			out = append(out, cmd)
+		case *list:
+			cmd := make([]string, 0, 2+len(v.items))
+			cmd = append(cmd, "RPUSH", k)
+			cmd = append(cmd, v.items...)
+			out = append(out, cmd)
+		case *hash:
+			cmd := make([]string, 0, 2+2*len(v.order))
+			cmd = append(cmd, "HSET", k)
+			for _, f := range v.order {
+				cmd = append(cmd, f, v.m[f])
+			}
+			out = append(out, cmd)
+		case *set:
+			cmd := make([]string, 0, 2+len(v.m))
+			cmd = append(cmd, "SADD", k)
+			members := make([]string, 0, len(v.m))
+			for m := range v.m {
+				members = append(members, m)
+			}
+			sort.Strings(members) // 排序保证重写输出确定性
+			cmd = append(cmd, members...)
+			out = append(out, cmd)
+		case *zsetVal:
+			items := v.sl.items() // 跳表序 = score asc, member asc
+			cmd := make([]string, 0, 2+2*len(items))
+			cmd = append(cmd, "ZADD", k)
+			for _, it := range items {
+				cmd = append(cmd, formatZScore(it.Score), it.Member)
+			}
+			out = append(out, cmd)
+		}
+	}
+	return out
+}
+
 // -------- list commands --------
 
 // ListPush prepends (front=true) or appends vals to the list at key, creating

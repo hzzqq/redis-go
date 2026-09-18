@@ -3,14 +3,17 @@ package server
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hzzqq/redis-go/internal/persist"
@@ -23,11 +26,23 @@ type Server struct {
 	store *store.Store
 	aof   *persist.AOF // nil = persistence disabled
 	addr  string       // listen address ("" until Listen is called)
+
+	// applyMu serializes the (dispatch → AOF-log) section of write commands.
+	// The invariant this protects: a write command's store commit and its AOF
+	// entry become visible atomically, so a concurrent BGREWRITEAOF snapshot
+	// can never see "committed but not yet logged" state (which would make
+	// the command appear both in the snapshot and in the post-rewrite log,
+	// e.g. duplicating an RPUSH after replay). Read commands bypass it.
+	applyMu sync.Mutex
+
+	// subMu guards the pub/sub hub below.
+	subMu     sync.Mutex
+	channels  map[string]map[*client]struct{} // channel → subscribed conns
 }
 
 // New returns a ready-to-serve in-memory Server.
 func New() *Server {
-	return &Server{store: store.New()}
+	return &Server{store: store.New(), channels: make(map[string]map[*client]struct{})}
 }
 
 // NewWithAOF returns a Server backed by an append-only file at path.
@@ -39,7 +54,7 @@ func NewWithAOF(path string) (*Server, error) {
 	if err != nil {
 		log.Printf("warning: %v", err)
 	}
-	s := &Server{store: store.New()}
+	s := &Server{store: store.New(), channels: make(map[string]map[*client]struct{})}
 	for _, v := range cmds {
 		s.dispatch(v)
 	}
@@ -79,20 +94,38 @@ func (s *Server) Listen(addr string) error {
 	}
 }
 
+// client is the per-connection state: one bufio writer guarded by writeMu
+// (command replies and pub/sub pushes interleave on the same socket, so every
+// write goes through here as one atomic WriteValue+Flush unit), plus the set
+// of channels this connection subscribes to.
+type client struct {
+	writeMu sync.Mutex
+	w       *bufio.Writer
+	chans   map[string]struct{}
+}
+
+// write serializes one reply/push onto the connection.
+func (c *client) write(v resp.Value) bool {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := resp.WriteValue(c.w, v); err != nil {
+		return false
+	}
+	return c.w.Flush() == nil
+}
+
 func (s *Server) handle(conn net.Conn) {
 	defer conn.Close()
 	r := resp.NewReader(conn)
-	w := bufio.NewWriter(conn)
+	cl := &client{w: bufio.NewWriter(conn), chans: make(map[string]struct{})}
+	defer s.dropClient(cl) // 断连自动退订所有频道
 	for {
 		v, err := r.Read()
 		if err != nil {
 			return
 		}
-		reply := s.apply(v)
-		if err := resp.WriteValue(w, reply); err != nil {
-			return
-		}
-		if err := w.Flush(); err != nil {
+		reply := s.applyConn(cl, v)
+		if !cl.write(reply) {
 			return
 		}
 		if reply.Type == resp.SimpleString && reply.Str == "OK" && isQuit(v) {
@@ -101,12 +134,202 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
+// applyConn layers connection-scoped semantics on top of apply: pub/sub
+// commands are handled per client, and while subscribed only subscription
+// commands, PING and QUIT are accepted (Redis subscribe-mode restriction).
+func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
+	cmd, ok := firstCmd(v)
+	if !ok {
+		return s.apply(v) // 非法协议形态保持原错误
+	}
+	args := v.Arr[1:]
+	switch cmd {
+	case "SUBSCRIBE":
+		return cl.subscribe(s, args)
+	case "UNSUBSCRIBE":
+		return cl.unsubscribe(s, args)
+	case "PUBLISH":
+		return s.cmdPublish(args)
+	case "PING":
+		if len(cl.chans) > 0 {
+			// 订阅模式下 PING 回复 [pong, <msg|"">] 数组（Redis 行为）
+			msg := ""
+			if len(args) > 0 {
+				msg = args[0].Str
+			}
+			return resp.Value{Type: resp.Array, Arr: []resp.Value{
+				{Type: resp.SimpleString, Str: "PONG"},
+				{Type: resp.BulkString, Str: msg},
+			}}
+		}
+	case "QUIT":
+		// 交给 apply 返回 OK，handle 负责断开
+	default:
+		if len(cl.chans) > 0 {
+			return resp.Value{Type: resp.Error, Str: fmt.Sprintf(
+				"ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+				strings.ToLower(cmd))}
+		}
+	}
+	return s.apply(v)
+}
+
+// firstCmd returns the upper-cased command name of v (false for non-arrays).
+func firstCmd(v resp.Value) (string, bool) {
+	if v.Type != resp.Array || len(v.Arr) == 0 || v.Arr[0].Type != resp.BulkString {
+		return "", false
+	}
+	return strings.ToUpper(v.Arr[0].Str), true
+}
+
+// subscribe handles SUBSCRIBE channel [channel ...]: registers the client on
+// each channel in the hub and replies with one [subscribe, channel, count]
+// row per channel (count = channels this connection now subscribes to).
+// Resubscribing to a joined channel is a no-op that still replies.
+func (c *client) subscribe(s *Server, args []resp.Value) resp.Value {
+	if len(args) == 0 {
+		return wrongArgs("subscribe")
+	}
+	s.subMu.Lock()
+	for _, a := range args {
+		ch := a.Str
+		if _, exists := c.chans[ch]; !exists {
+			c.chans[ch] = struct{}{}
+		}
+		set, ok := s.channels[ch]
+		if !ok {
+			set = make(map[*client]struct{})
+			s.channels[ch] = set
+		}
+		set[c] = struct{}{}
+	}
+	s.subMu.Unlock()
+	out := make([]resp.Value, 0, len(args))
+	for _, a := range args {
+		out = append(out, resp.Value{Type: resp.Array, Arr: []resp.Value{
+			{Type: resp.BulkString, Str: "subscribe"},
+			{Type: resp.BulkString, Str: a.Str},
+			{Type: resp.Integer, Num: int64(len(c.chans))},
+		}})
+	}
+	if len(out) == 1 {
+		return out[0]
+	}
+	return resp.Value{Type: resp.Array, Arr: out}
+}
+
+// unsubscribe handles UNSUBSCRIBE [channel ...]: with no arguments it
+// unsubscribes from all channels of this connection. Rows follow the
+// [unsubscribe, channel, count] shape; with nothing subscribed the single
+// row carries a null channel name. Unknown channel names still get a row
+// (with the current count), matching Redis.
+func (c *client) unsubscribe(s *Server, args []resp.Value) resp.Value {
+	var targets []string
+	if len(args) == 0 {
+		for ch := range c.chans {
+			targets = append(targets, ch)
+		}
+		sort.Strings(targets) // map 遍历序随机，排序保证回复确定
+	} else {
+		targets = make([]string, 0, len(args))
+		for _, a := range args {
+			targets = append(targets, a.Str)
+		}
+	}
+	s.subMu.Lock()
+	for _, ch := range targets {
+		if _, was := c.chans[ch]; !was {
+			continue
+		}
+		delete(c.chans, ch)
+		if set, ok := s.channels[ch]; ok {
+			delete(set, c)
+			if len(set) == 0 {
+				delete(s.channels, ch)
+			}
+		}
+	}
+	s.subMu.Unlock()
+	if len(targets) == 0 {
+		return resp.Value{Type: resp.Array, Arr: []resp.Value{
+			{Type: resp.BulkString, Str: "unsubscribe"},
+			{Type: resp.BulkString, Null: true},
+			{Type: resp.Integer, Num: 0},
+		}}
+	}
+	out := make([]resp.Value, 0, len(targets))
+	for _, ch := range targets {
+		out = append(out, resp.Value{Type: resp.Array, Arr: []resp.Value{
+			{Type: resp.BulkString, Str: "unsubscribe"},
+			{Type: resp.BulkString, Str: ch},
+			{Type: resp.Integer, Num: int64(len(c.chans))},
+		}})
+	}
+	if len(out) == 1 {
+		return out[0]
+	}
+	return resp.Value{Type: resp.Array, Arr: out}
+}
+
+// cmdPublish handles PUBLISH channel message: delivers [message, channel,
+// payload] to every subscriber of the channel and replies with the receiver
+// count. Delivery writes each subscriber's socket under its writeMu, so a
+// slow subscriber applies TCP backpressure to the publisher (prototype
+// simplification; Redis uses output-buffer limits + disconnect instead).
+func (s *Server) cmdPublish(args []resp.Value) resp.Value {
+	if len(args) != 2 {
+		return wrongArgs("publish")
+	}
+	ch, payload := args[0].Str, args[1].Str
+	s.subMu.Lock()
+	var targets []*client
+	if set, ok := s.channels[ch]; ok {
+		targets = make([]*client, 0, len(set))
+		for c := range set {
+			targets = append(targets, c)
+		}
+	}
+	s.subMu.Unlock()
+	msg := resp.Value{Type: resp.Array, Arr: []resp.Value{
+		{Type: resp.BulkString, Str: "message"},
+		{Type: resp.BulkString, Str: ch},
+		{Type: resp.BulkString, Str: payload},
+	}}
+	for _, c := range targets {
+		c.write(msg) // 写失败 = 对端已断开，其 handle 循环负责清理
+	}
+	return resp.Value{Type: resp.Integer, Num: int64(len(targets))}
+}
+
+// dropClient removes a closing connection from every channel it subscribed
+// to (runs via defer in handle).
+func (s *Server) dropClient(cl *client) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for ch := range cl.chans {
+		if set, ok := s.channels[ch]; ok {
+			delete(set, cl)
+			if len(set) == 0 {
+				delete(s.channels, ch)
+			}
+		}
+	}
+	cl.chans = make(map[string]struct{})
+}
+
 // apply executes v and, when AOF is enabled and the command succeeded,
 // appends the canonical form of the write command to the file before the
 // reply is returned (Redis executes, then propagates, then replies). The
 // reply is passed along because some commands (SPOP) canonicalize to a form
-// derived from what actually happened.
+// derived from what actually happened. Write commands run dispatch and log
+// atomically under applyMu (see the Server field comment); reads stay
+// lock-free and concurrent.
 func (s *Server) apply(v resp.Value) resp.Value {
+	if !isWriteCmd(v) {
+		return s.dispatch(v)
+	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	reply := s.dispatch(v)
 	if s.aof == nil || reply.Type == resp.Error {
 		return reply
@@ -117,6 +340,13 @@ func (s *Server) apply(v resp.Value) resp.Value {
 		}
 	}
 	return reply
+}
+
+// isWriteCmd reports whether v dispatches a state-mutating command (the
+// cheap pre-dispatch check that gates the applyMu critical section).
+func isWriteCmd(v resp.Value) bool {
+	return v.Type == resp.Array && len(v.Arr) > 0 &&
+		writeCmds[strings.ToUpper(v.Arr[0].Str)]
 }
 
 func isQuit(v resp.Value) bool {
@@ -566,6 +796,8 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		return s.cmdInfo(args)
 	case "CONFIG":
 		return s.cmdConfig(args)
+	case "BGREWRITEAOF":
+		return s.cmdBGRewriteAOF()
 	case "FLUSHALL":
 		s.store.Flush()
 		return resp.Value{Type: resp.SimpleString, Str: "OK"}
@@ -1043,6 +1275,33 @@ func (s *Server) cmdZRem(args []resp.Value) resp.Value {
 	return resp.Value{Type: resp.Integer, Num: n}
 }
 
+// cmdBGRewriteAOF handles BGREWRITEAOF: replaces the AOF with the minimal
+// canonical command set of the current store snapshot. Unlike Redis (fork +
+// background child), this runs synchronously under applyMu — when the reply
+// arrives the rewrite is already complete, which is a strictly stronger
+// guarantee. Pub/sub traffic never touches the AOF, so it needs no rewrite.
+func (s *Server) cmdBGRewriteAOF() resp.Value {
+	if s.aof == nil {
+		return errReply(errors.New(
+			"ERR Append only file is disabled: please check \"appendonly\" configuration"))
+	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	// applyMu 之下做快照：此刻没有任何写命令处于「已入库、未落盘」状态，
+	// 快照与重写后追加的日志合起来与真实状态一致（见 applyMu 字段注释）。
+	snap := s.store.Snapshot()
+	vals := make([]resp.Value, 0, len(snap))
+	for _, cmd := range snap {
+		if len(cmd) > 0 {
+			vals = append(vals, respCmd(cmd...))
+		}
+	}
+	if err := s.aof.Rewrite(vals); err != nil {
+		return resp.Value{Type: resp.Error, Str: "ERR " + err.Error()}
+	}
+	return resp.Value{Type: resp.SimpleString, Str: "Background append only file rewriting started"}
+}
+
 // infoSection is one block of the INFO reply (header line + fields + blank).
 type infoSection struct {
 	name string
@@ -1077,7 +1336,7 @@ func (s *Server) infoSections() []infoSection {
 		aofEnabled = "1"
 	}
 	server := "# Server\r\n" +
-		"redis_version:redis-go-0.4.0\r\n" +
+		"redis_version:redis-go-0.5.0\r\n" +
 		"redis_mode:standalone\r\n" +
 		"os:" + runtime.GOOS + "\r\n" +
 		"go_version:" + runtime.Version() + "\r\n" +

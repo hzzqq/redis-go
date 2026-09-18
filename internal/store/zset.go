@@ -542,3 +542,9 @@ func (s *Store) zsetItems(key string) []ZItem {
 	return z.sl.items()
 }
 
+// formatZScore renders a score for AOF rewrite: the shortest decimal that
+// round-trips through ParseFloat (so replayed floats are bit-identical).
+func formatZScore(f float64) string {
+	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+

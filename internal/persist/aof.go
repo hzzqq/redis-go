@@ -48,6 +48,56 @@ func (a *AOF) Close() error {
 	return a.f.Close()
 }
 
+// Rewrite atomically replaces the AOF contents with cmds (the minimal
+// canonical command set produced by a store snapshot): RESP-encode to
+// <path>.tmp, fsync, then rename over the original file and reopen it for
+// appending. On Windows a file cannot be renamed over an open handle, so the
+// old handle is closed just before the rename and a fresh one is opened
+// after. The caller must guarantee no Log is in flight (the server
+// serializes writes); a.mu still guards Log/Sync/Close from other paths.
+func (a *AOF) Rewrite(cmds []resp.Value) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	tmp := a.f.Name() + ".tmp"
+	tf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("aof: rewrite: open %s: %w", tmp, err)
+	}
+	werr := func() error {
+		for _, v := range cmds {
+			if err := resp.WriteValue(tf, v); err != nil {
+				return err
+			}
+		}
+		return tf.Sync()
+	}()
+	if cerr := tf.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("aof: rewrite: %w", werr)
+	}
+	// 先关旧句柄再改名（Windows 限制）；改名失败则重开旧文件兜底，状态不受损。
+	if err := a.f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("aof: rewrite: close old: %w", err)
+	}
+	if err := os.Rename(tmp, a.f.Name()); err != nil {
+		os.Remove(tmp)
+		if nf, e2 := os.OpenFile(a.f.Name(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); e2 == nil {
+			a.f = nf
+		}
+		return fmt.Errorf("aof: rewrite: rename: %w", err)
+	}
+	nf, err := os.OpenFile(a.f.Name(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("aof: rewrite: reopen: %w", err)
+	}
+	a.f = nf
+	return nil
+}
+
 // Load reads every RESP value in path. A missing file yields (nil, nil) so a
 // fresh server starts clean. A truncated tail (e.g. crash mid-write) is
 // tolerated: every command parsed before the truncation point is returned
