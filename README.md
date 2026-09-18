@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 8）
+# redis-go · Go 复刻 Redis（Phase 9）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -62,6 +62,16 @@
 - **Lua 脚本（EVAL/EVALSHA/SCRIPT）**：gopher-lua（纯 Go Lua 5.1）——`redis.call/pcall/status_reply/error_reply` + KEYS/ARGV 表注入。**效果复制**：脚本内写命令经 canonicalWrite 确定化（SPOP→SREM、相对 TTL→PXAT）落 AOF + 传播副本，**脚本本身不落盘不原样传播**（重启/副本重放状态严格一致，实测）；全程持 applyMu 保证原子；**无回滚**（脚本报错时先前效果照常生效并传播，对齐 Redis——不传播会分叉）；副本上脚本可读、写调用回 READONLY 中止；事务内 EVAL 效果并入 MULTI...EXEC 块；`SCRIPT LOAD/EXISTS/FLUSH` + `EVALSHA`（未命中回 NOSCRIPT，sha 缓存进程内、重启丢失，Redis 同）；脚本内禁 BGREWRITEAOF（applyMu 重入死锁）。Lua↔RESP 转换矩阵（nil/false→null bulk、true→整数 1、`{ok=}`/`{err=}`→状态/错误），错误文本单行净化（RESP 错误行禁内嵌换行）。
 - **基线扩展（cmd/bench，Windows 本机）**：`-cmd` 新增 `EVAL`/`EVALSHA`/`CAS`（WATCH→MULTI→SET→EXEC，4 次往返/op）。SET 188.8k ops/s（c=50 p=1）；GET **474.4k ops/s**（pipeline 16）；EVAL 8.0k / EVALSHA 7.5k ops/s（c=20，LState 每次新建是瓶颈，语义正确优先不做池化）；CAS 19.9k ops/s（c=10）。
 - **工程**：go.mod 升 **go 1.23**（gopher-lua v1.1.0 要求）；新增 eval_test.go 8 用例 + psync_test.go 4 用例（backlog 环形语义 / 全量→部分→回退三路径 / ACK 收敛）。
+
+### Phase 9 — SCAN 游标族 + List 补全 + appendfsync + 过期选项矩阵（本提交）
+- **SCAN/SSCAN/HSCAN/ZSCAN**：`SCAN cursor [MATCH p] [COUNT n] [TYPE t]` 与三集合变体（HSCAN/ZSCAN 扁平 `[field, value, ...]`）。游标语义为**排序快照 + 偏移**：keyspace 排序后按 COUNT 前进，与 Redis 的 reverse-binary-iteration 不同——无保证跨库迭代不重不漏，但在**稳定 keyspace 上恰好一次全覆盖**（`globMatch` 为 stringmatchlen 直译：`*?[a-z][^..]\转义`、`[]]` 首字符字面量）；MATCH 过滤后一页可能为空（真实 Redis 同行为），COUNT 是扫描量而非返回量。SSCAN/HSCAN/ZSCAN 的 cursor 解析需先剥 key（冒烟前单测暴露的参数错位）。
+- **List 补全**：`LMOVE src dst LEFT|RIGHT LEFT|RIGHT`（单写锁原子；同 key 自轮转保 TTL；弹空源删 key；新 dst 无 TTL / 旧 dst 保 TTL——与 RPOP+LPUSH 组合的语义差异）`LINSERT key BEFORE|AFTER pivot el`（0=无 key、-1=pivot 不存在）`LPOS key el [RANK n] [COUNT n] [MAXLEN n]`（RANK 0 报 Redis 原文长错误；COUNT 回 Integer 数组、无匹配 null；**MAXLEN 限制总比较量含收集阶段**——单循环实现对齐 t_list.c，先定位后收集的两段式会绕过 MAXLEN）。
+- **appendfsync 三档**：`-appendfsync always|everysec|no`（默认 everysec）+ 运行期 `CONFIG SET`/`GET appendfsync` + `INFO persistence` 新增 `aof_fsync:`。`always` 每次 Log 同步 fsync；`everysec` 后台 goroutine 1s ticker（**崩溃最多丢 ~1s 已确认写入**，Redis 默认权衡）；`no` 只到页缓存。启停生命周期：切到 everysec 启 goroutine、切走即停、`Close` 等待退出；非法值回退 no。
+- **EXPIRE 选项 + SET 收尾 + OBJECT**：`EXPIRE/PEXPIREAT/PEXPIRE/EXPIREAT key n NX|XX|GT|LT`（NX/XX 与 GT/LT 冲突报 Redis 同文错误；**key 不存在一律 0**；无 TTL key 上 GT 失败/LT 成功；条件落盘规则见下）`OBJECT ENCODING`（int/embstr≤44/raw、listpack≤128、intset 全整数≤512、skiplist，阈值对齐 Redis）`SET` 选项矩阵收尾（`NX/XX/GET/KEEPTTL` 组合、`NX+XX`/`KEEPTTL+EX|PX` syntax error、GET 对 WRONGTYPE 回错）。
+- **canonicalWrite 修复（SET NX+GET 消歧）**：`SET k v NX GET` 在**新 key** 上成功时旧值为 null、回复与「NX 失败」同为 null bulk——原实现误判为失败不落盘，**重启丢 key**。修法：dispatch 前捕获 key 存在性快照（`setPreState`，仅 NX+GET 组合访问 store），5 个 canonicalWrite 调用点（apply/事务/主库流/事务块/EVAL 效果）统一传入。落盘规则同步细化：NX 无 GET / XX（含 XX+GET）失败不落盘；GET 无 NX/XX（无条件 SET、旧值 null）落盘。
+- **回归修复（单测驱动）**：`cmdLMove` 参数下标错位（args 不含命令名，却按下标 1/2 取方向词）——`LMOVE` 一律 syntax error 且 WATCH 触碰连带失效；`store.ListPos` MAXLEN 两段式实现绕过收集阶段限制——重写为单循环；`TestCanonicalWritePhase9` 误用 dispatch（纯执行不落盘）——写命令改走 apply。
+- **基准与对照（cmd/bench，Windows 本机 n=100k）**：无 AOF——SET 250.0k（c=50 p=1）/ GET 264.2k / GET **623.8k**（pipeline 16）/ EVAL 9.5k / EVALSHA 9.6k（c=20）/ CAS 25.9k（c=10）。AOF 对照：everysec SET 38.1k、always SET 963 ops/s（Windows 每次 fsync p50 52ms，凸显三档策略的实际代价）。**redis-benchmark 对照**：本机无 redis-server/redis-benchmark 可用（docker 守护进程损坏、WSL 不支持），对照表以同参数复测自基线替代，等价命令见下节。
+- **测试**：新增 27 个测试函数（store/cmds9_test.go 10 + server/cmds9_test.go 13 + persist/fsync_test.go 4），全量 build/vet/test 3 轮 + 83 断言 TCP 冒烟（SCAN 分页/MATCH/TYPE、SSCAN/HSCAN/ZSCAN、OBJECT、LMOVE 轮转跨 key、LINSERT、LPOS 选项、SET/EXPIRE 选项矩阵、everysec 重启回放、LMOVE/EXPIRE/SET NX GET 副本传播）。
 
 ## 与 redis-cli 联调
 
@@ -132,6 +142,30 @@ redis-cli eval "return redis.call('SET', KEYS[1], ARGV[1])" 1 gk gv
 redis-cli eval "return {KEYS[1], ARGV[1]}" 1 a b    # 1) "a"  2) "b"
 redis-cli script load "return ARGV[1]"              # 40 位 sha
 redis-cli evalsha <sha> 0 hello      # "hello"；未登记的 sha 回 NOSCRIPT 错误
+
+# ── SCAN 游标族 + List 补全 + 过期选项（Phase 9）──
+redis-cli scan 0 count 10                 # 1) "10"  2) 1) "key:0" ...（游标 0 = 一轮结束）
+redis-cli scan 0 match "user:*" type string
+redis-cli sscan myset 0 count 100
+redis-cli hscan myhash 0 match "f*"       # 扁平 1) "f1" 2) "v1" ...
+redis-cli zscan lb 0                      # 扁平 member/score 交替
+redis-cli object encoding counter         # "int"（小整数）；embstr ≤44B；更长达 "raw"
+redis-cli lmove src dst left right        # 头弹尾推；同 key 即轮转
+redis-cli linsert mylist before "c" "b"   # (integer) 3；pivot 不存在回 -1
+redis-cli lpos mylist "a" rank 2 count 10 maxlen 100   # 1) (integer) 0 2) (integer) 2 ...
+redis-cli expire k 100 nx                 # 已有 TTL 回 0；xx/gt/lt 同理
+redis-cli set k v nx get keepttl          # 组合选项；NX+XX / KEEPTTL+EX 回 syntax error
+redis-cli config get appendfsync          # everysec（默认）；CONFIG SET 运行期切换
+redis-cli info persistence | grep aof_fsync
+
+# redis-benchmark 等价命令（本机无真实 Redis 可用时，用 cmd/bench 同参数复测自基线）：
+#   redis-benchmark -n 100000 -c 50 -t set,get
+#   redis-benchmark -n 100000 -c 50 -P 16 -t get
+#   redis-benchmark -n 100000 -c 20 -t eval   （EVAL "return 1" 0）
+#   redis-benchmark -n 100000 -c 10 --eval cas.lua
+go run ./cmd/bench -addr 127.0.0.1:6379 -n 100000 -c 50 -cmd SET
+go run ./cmd/bench -addr 127.0.0.1:6379 -n 100000 -c 50 -pipeline 16 -cmd GET
+
 ```
 
 重启后数据仍在（AOF 模式）：`foo`、列表、哈希全部回放，TTL 按真实流逝时间继续衰减。
@@ -161,15 +195,17 @@ redis-cli ──TCP──▶ server.Listen
 
 **复制模型**：写命令在 `applyMu` 临界区内「执行 → canonical 化 → AOF 落盘 + 副本入队 + repl-backlog feed」一步完成；每条副本连接一个独立 writer goroutine 出站（队列积压超 256MB 断开）；副本断线重连先试 `PSYNC <replid> <offset>` 部分重同步（1 MiB 环形 backlog 续传增量，超出范围退化全量 RDB）；主库每秒 REPLCONF GETACK 收集副本进度（INFO 可观测）。锁序：`applyMu → replMu → link.mu`。
 
-## 下一步（Phase 9）
+## 下一步（Phase 10）
 
 - [x] 主从复制（全量 RDB 同步 + 命令流传播、级联、REPLICAOF/READONLY/INFO replication）
 - [x] WATCH/UNWATCH 乐观锁、部分重同步（repl-backlog + PSYNC CONTINUE + REPLCONF ACK）、Lua 脚本（EVAL/EVALSHA/SCRIPT）
-- [ ] SCAN/SSCAN/HSCAN/ZSCAN 游标遍历
-- [ ] List 补全：LMOVE / LINSERT / LPOS
-- [ ] appendfsync everysec（后台 fsync + 崩溃丢失窗口语义）
-- [ ] EXPIRE NX/XX/GT/LT 选项、SET 选项矩阵收尾、OBJECT ENCODING
-- [ ] redis-benchmark 与真实 Redis 同机对照表
+- [x] SCAN/SSCAN/HSCAN/ZSCAN 游标遍历
+- [x] List 补全：LMOVE / LINSERT / LPOS
+- [x] appendfsync everysec（后台 fsync + 崩溃丢失窗口语义）
+- [x] EXPIRE NX/XX/GT/LT 选项、SET 选项矩阵收尾、OBJECT ENCODING
+- [x] redis-benchmark 对照基线（真实 Redis 不可用，以同参数复测自基线 + 等价命令文档化替代）
+
+可选后续：阻塞命令（BLPOP/BRPOP/BRPOPLPUSH）、SORT 命令、STREAM 类型、AOF everysec 的 30s 兜底 fsync（Redis fsync 停滞保护）、真实 Redis 同机对照（待可用环境）。
 
 ## 测试与验收
 
@@ -184,3 +220,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-18：Phase 6（`9892632`+`292accc`）MULTI/EXEC 事务 + RDB 快照 + ZRANGEBYSCORE 族 + MGET/MSET/ZRANDMEMBER；全量测试 3 轮通过 + 34/34 TCP 冒烟（EXECABORT 不执行、RDB 重启回放含 TTL、CRC 损坏拒启、事务 AOF 块重启一致）。
 - 2026-09-18：Phase 7 主从复制：全量测试 3 轮通过（新增 replication_test.go 7 用例 + rdb 字节级 round-trip）+ 32/32 双实例 TCP 冒烟（五类型 + TTL 传播、事务块传播、SPOP 确定化、杀副本重启重同步、杀主库重启重连、REPLICAOF NO ONE 晋升）；冒烟另暴露并修复 3 处回归（见 Phase 7 章节）。
 - 2026-09-18：Phase 8 WATCH 乐观锁 + 部分重同步（repl-backlog/PSYNC CONTINUE/REPLCONF ACK）+ Lua 脚本（EVAL/EVALSHA/SCRIPT 效果复制）+ bench 扩展（EVAL/EVALSHA/CAS）：全量测试 3 轮通过（新增 eval_test.go 8 用例 + psync_test.go 4 用例）+ 双实例 TCP 冒烟（五类型 + TTL 传播、EVAL 效果传播与重启恢复、WATCH 中止/UNWATCH 恢复、SCRIPT 族、部分重同步主/副日志断言、副本重启走全量、ACK offset 收敛）；冒烟另暴露 EXEC 乐观锁中止回复应为 `*-1` null array（原为 `$-1`，已修 resp 编码器并更新回归测试）。
+- 2026-09-18：Phase 9 SCAN/SSCAN/HSCAN/ZSCAN 游标族 + LMOVE/LINSERT/LPOS + appendfsync always/everysec/no + EXPIRE NX/XX/GT/LT + SET NX/XX/GET/KEEPTTL 收尾 + OBJECT ENCODING：全量测试 3 轮通过（新增 27 个测试函数）+ 83 断言 TCP 冒烟（SCAN 分页/MATCH/TYPE、三集合 SSCAN、OBJECT、LMOVE 轮转/跨 key、LPOS 选项、SET/EXPIRE 选项矩阵、everysec 重启回放、副本传播）。单测另暴露并修复 2 处缺陷：cmdLMove 参数下标错位（LMOVE 全体 syntax error + WATCH 触碰连带失效）、canonicalWrite 把 `SET NX GET` 新 key 成功（旧值 null）误判为 NX 失败不落盘（重启丢 key，dispatch 前 key 存在性快照消歧，5 调用点统一）。基准复测：无 AOF SET 250k/GET-p16 624k/EVAL 9.5k/CAS 25.9k ops/s；AOF everysec 38.1k、always 963 ops/s（Windows fsync p50 52ms）。
