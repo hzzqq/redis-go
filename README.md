@@ -1,4 +1,4 @@
-# redis-go · Go 复刻 Redis（Phase 11）
+# redis-go · Go 复刻 Redis（Phase 12）
 
 用 Go 从零复刻 Redis 的核心协议、内存数据模型与持久化，目标是**可被官方 `redis-cli` 直接连接验证**——这是后端岗的硬通货级项目。
 
@@ -88,6 +88,16 @@
 - **阻塞 XREAD（Phase 10 同款并发模型）**：applyMu 临界区内完成「快路径检查 + `$` 快照 + 注册」，等待者不持锁睡眠；唤醒在 XADD 提交的 applyMu 临界区内（logAndPropagate → serveStreamWaiters），流读**非消费**——同一批新条目唤醒全部等待者、各自独立快照回复，不产生确定性帧（AOF 只有 XADD）；200ms 读探针防死喂；MULTI 内非阻塞、脚本内禁用 BLOCK。锁序：`applyMu → xwMu`。
 - **持久化/复制**：AOF/XRANGE 语义对齐（显式 ID 帧重放）、RDB kind 5 支持 stream（ms/seq + 字段序列双向编解码，向后兼容不 bump 版本）、Snapshot 导出显式 ID XADD；XADD/XDEL/XTRIM 走写路径传播副本，XREAD 纯读。
 - **测试**：新增 store stream_test + server cmds11_test 共 19 个测试函数，全量 build/vet/test 3 轮 + 23/23 TCP 冒烟（显式/自动 ID、排他端点、NOMKSTREAM、XDEL 清空删 key、XTRIM MAXLEN/MINID、BLOCK 唤醒与超时 null、**重启回放 ID 一致 + 自动 ID 续接不漂移**、副本传播收敛、副本拒写）。消费者组（XGROUP/XREADGROUP/XACK）留 Phase 12。
+
+### Phase 12 — STREAM 消费者组（本提交）
+
+- **组状态（`internal/store/streamgroup.go`）**：`streamGroup{name, lastDelivered, pel map[StreamID]*pelEntry, consumers}`；PEL 记录 consumer 归属、投递毫秒、投递计数。XGROUP CREATE（`$`/显式 ID/MKSTREAM）/SETID/DESTROY/CREATECONSUMER/DELCONSUMER；组不存在 BUSYGROUP/NOGROUP 同文错误。
+- **XREADGROUP（`internal/server/cmds12.go`）**：`>` 服务未投递条目并推进 lastDelivered（NOACK 同样推进、但不进 PEL）；显式 ID 服务该消费者 PEL 历史（count++ 刷新投递时间）；XDEL 幽灵条目在 history 读与 XCLAIM 时从 PEL 清除且不返回（Redis 7 清理语义）。BLOCK 仅允许 `>`（复用 Phase 11 流阻塞基础设施：applyMu 临界区内快路径+注册，同组多等待者 FIFO 先到先得，唤醒挂 XADD 提交路径）。
+- **PEL 效果帧化（对齐 Redis streamPropagateXCLAIM）**：XREADGROUP 本身永不落盘/传播（读命令），投喂效果由 canonicalFor 读回 PEL 精确状态帧化为 **`XCLAIM key group consumer 0 <id> TIME <ms> RETRYCOUNT <n> FORCE JUSTID`** 逐条帧——FORCE 让重放侧从无到有建 PEL，JUSTID 抑制自动刷新而显式 TIME/RETRYCOUNT 精确定格状态；`>` 位点推进另以 **`XGROUP SETID`** 帧落盘（缺它重启后 `>` 会重复投递）。NOACK 无 PEL 变化自然无帧（只有 SETID）。
+- **XACK/XPENDING/XCLAIM**：XACK 原样落盘（缺失组回 0 不报错，Redis 同）；XPENDING summary（count/min/max/每消费者计数）+ detail（`-`/`+`/`(` 端点、idle=now-投递毫秒）；XCLAIM 支持 min-idle 门 + IDLE/TIME/RETRYCOUNT/FORCE/JUSTID 全选项，原样落盘。
+- **空流生命周期修正**：有消费者组的流被 XDEL/XTRIM 清空后**保留空 key**（组状态存活，Redis 7 同）；组 DESTROY 后若流已空则删 key。AOF 重写（Snapshot）输出 XGROUP CREATE MKSTREAM + 逐条 XCLAIM FORCE JUSTID + 空 PEL 消费者 CREATECONSUMER 重建命令；RDB **kind 6** = stream + 组（消费者/PEL 确定序列化，向后兼容不 bump 版本）。
+- **副本语义**：XGROUP/XACK/XCLAIM 原样传播收敛副本；XREADGROUP 副本按读放行（连接级与 MULTI 两处豁免 READONLY 门，Phase 10 阻塞命令先例），其投喂效果照常向级联下游传播。脚本内禁用 XREADGROUP（效果收集路径未验证，诚实收窄）；WATCH 触碰经 writeCmdKeys 的 STREAMS keys 提取。
+- **测试**：新增 17 个测试函数（store 9 + server 8）+ RDB kind6 字节级 round-trip，全量 build/vet/test 3 轮 + 19/19 TCP 冒烟（组管理全子命令、投喂/NOACK/history 计数、XACK、XCLAIM 选项矩阵、**AOF 重启回放组+PEL+位点不重复投递**、BGREWRITEAOF 重建、副本 PEL 收敛+READONLY、RDB SAVE/load 组恢复、空流+组保留、BLOCK 唤醒）。XAUTOCLAIM/XINFO 留后续。
 
 ## 与 redis-cli 联调
 
@@ -199,6 +209,20 @@ redis-cli xtrim st maxlen 100             # 或 minid <id>；~ 接受但按精�
 redis-cli type st                         # stream
 # NOMKSTREAM：key 不存在时 XADD 返回 (nil) 且不建 key
 
+# ── STREAM 消费者组（Phase 12）──
+redis-cli xgroup create st grp $          # 从尾部建组；0-0 = 从头；MKSTREAM 可先建空流
+redis-cli xreadgroup group grp alice count 2 streams st >
+                                          # '>' 取新条目并入 PEL（alice 的待确认列表）
+redis-cli xpending st grp                 # [count, min, max, [[consumer, count]...]]
+redis-cli xpending st grp - + 10          # detail: [id, consumer, idle-ms, count]
+redis-cli xreadgroup group grp alice streams st 0-0
+                                          # 显式 ID = 重读自己 PEL 的历史（count 递增）
+redis-cli xack st grp 1-0                 # 确认后离开 PEL
+redis-cli xclaim st grp bob 60000 2-0     # 空闲超 60s 的条目认领给 bob（FORCE/JUSTID/TIME/RETRYCOUNT 同用）
+redis-cli xreadgroup group grp alice block 0 streams st >
+                                          # 阻塞等新条目（XADD 唤醒，同组 FIFO 先到先得）
+redis-cli xgroup destroy st grp           # 删组；清空且有组的流 XDEL 后保留空 key
+
 # redis-benchmark 等价命令（本机无真实 Redis 可用时，用 cmd/bench 同参数复测自基线）：
 #   redis-benchmark -n 100000 -c 50 -t set,get
 #   redis-benchmark -n 100000 -c 50 -P 16 -t get
@@ -240,7 +264,9 @@ redis-cli ──TCP──▶ server.Listen
 
 **流阻塞模型（Phase 11）**：XREAD BLOCK 复用同款「临界区内快照 + 注册」消除空窗，唤醒挂在 XADD 提交路径（serveStreamWaiters）；流读**非消费**——不产出确定性帧，AOF 只记 XADD，每个等待者独立全量快照回复（消费位点在客户端，这正是消费者组 Phase 12 要补的语义）。锁序：`applyMu → xwMu`。
 
-## 下一步（Phase 12）
+**消费者组模型（Phase 12）**：XREADGROUP 是读命令但投喂改 PEL——执行在 applyMu 临界区内，效果由 canonicalFor 读回 PEL 帧化为 `XCLAIM ... FORCE JUSTID` + `XGROUP SETID`（位点），与 XADD 帧同批落盘/传播，重放/副本/重启严格收敛；阻塞 XREADGROUP 同组 FIFO 单消费（`>` 位点组状态自持），不同组独立位点。
+
+## 下一步（Phase 13 可选）
 
 - [x] 主从复制（全量 RDB 同步 + 命令流传播、级联、REPLICAOF/READONLY/INFO replication）
 - [x] WATCH/UNWATCH 乐观锁、部分重同步（repl-backlog + PSYNC CONTINUE + REPLCONF ACK）、Lua 脚本（EVAL/EVALSHA/SCRIPT）
@@ -253,8 +279,9 @@ redis-cli ──TCP──▶ server.Listen
 - [x] SORT 全选项（BY/GET/LIMIT/ASC/DESC/ALPHA/STORE）
 - [x] AOF everysec 30s 停滞看门狗（主路径兜底 fsync + INFO aof_fsync_stalls）
 - [x] STREAM 类型核心（XADD/XLEN/XRANGE/XREVRANGE/XDEL/XTRIM/XREAD 含 BLOCK + RDB kind5 + 自动 ID 确定化）
+- [x] STREAM 消费者组（XGROUP/XREADGROUP/XACK/XPENDING/XCLAIM + PEL 帧化 + RDB kind6 + 阻塞投喂）
 
-可选后续：消费者组（XGROUP/XREADGROUP/XACK/XPEL/XCLAIM）、真实 Redis 同机对照（待可用环境）、Lua state 池化等性能打磨、CONFIG 体系扩展。
+可选后续：XAUTOCLAIM / XINFO 组观测、真实 Redis 同机对照（待可用环境）、Lua state 池化等性能打磨、CONFIG 体系扩展。
 
 ## 测试与验收
 
@@ -272,3 +299,4 @@ go build ./... && go vet ./... && go test ./...
 - 2026-09-18：Phase 9 SCAN/SSCAN/HSCAN/ZSCAN 游标族 + LMOVE/LINSERT/LPOS + appendfsync always/everysec/no + EXPIRE NX/XX/GT/LT + SET NX/XX/GET/KEEPTTL 收尾 + OBJECT ENCODING：全量测试 3 轮通过（新增 27 个测试函数）+ 83 断言 TCP 冒烟（SCAN 分页/MATCH/TYPE、三集合 SSCAN、OBJECT、LMOVE 轮转/跨 key、LPOS 选项、SET/EXPIRE 选项矩阵、everysec 重启回放、副本传播）。单测另暴露并修复 2 处缺陷：cmdLMove 参数下标错位（LMOVE 全体 syntax error + WATCH 触碰连带失效）、canonicalWrite 把 `SET NX GET` 新 key 成功（旧值 null）误判为 NX 失败不落盘（重启丢 key，dispatch 前 key 存在性快照消歧，5 调用点统一）。基准复测：无 AOF SET 250k/GET-p16 624k/EVAL 9.5k/CAS 25.9k ops/s；AOF everysec 38.1k、always 963 ops/s（Windows fsync p50 52ms）。
 - 2026-09-18：Phase 10 阻塞弹出（BLPOP/BRPOP/BRPOPLPUSH）+ SORT 全选项 + AOF everysec 30s 停滞看门狗：全量测试 3 轮通过（新增 18 个测试函数）+ 33/33 TCP 冒烟（阻塞唤醒/超时 null/多 key 顺序/断连不死喂/MULTI 非阻塞、SORT 数值/DESC/ALPHA/LIMIT/GET null/BY hash/STORE 空删、INFO aof_fsync_stalls、AOF 重启回放含阻塞弹出帧序）。单测暴露并修复 2 处缺陷：everysec 启动 lastSync 零值（1970）误报兜底一次（SetFsync 启动刷盘时刷新时间戳）、writeCmdKeys 的 LMOVE 误取方向词当 dst（WATCH 乐观锁对 dst 失效）。
 - 2026-09-18：Phase 11 STREAM 类型核心（XADD/XLEN/XRANGE/XREVRANGE/XDEL/XTRIM/XREAD 含 BLOCK + RDB kind5）：全量测试 3 轮通过（新增 19 个测试函数：store 8 + server 11）+ 23/23 TCP 冒烟（显式/自动 ID 语义、`(` 排他与裸数字毫秒端点、NOMKSTREAM、XDEL 清空删 key、XTRIM MAXLEN/MINID、BLOCK 唤醒/超时 null、重启回放 ID 一致 + 自动 ID 续接不漂移、副本传播收敛 + 拒写）。冒烟另暴露并补齐 1 处缺口：XRANGE/XREVRANGE 命令层缺 COUNT 选项（store 层已支持）。消费者组留 Phase 12。
+- 2026-09-19：Phase 12 STREAM 消费者组（XGROUP/XREADGROUP/XACK/XPENDING/XCLAIM + PEL 效果帧化 + RDB kind6）：全量测试 3 轮通过（新增 17 个测试函数：store 9 + server 8）+ 19/19 TCP 冒烟（组管理全子命令与 BUSYGROUP/NOGROUP、投喂/NOACK/history 计数、XACK、XCLAIM FORCE/TIME/RETRYCOUNT/JUSTID、AOF 重启回放组+PEL+位点不重复投递、BGREWRITEAOF 重建、副本 PEL 收敛 + READONLY、RDB SAVE/load 组恢复、空流+组保留、BLOCK 唤醒）。开发中修正 1 处语义缺口：XREADGROUP `>` 位点推进需以 XGROUP SETID 帧落盘（XCLAIM 不动 lastDelivered，缺帧重启后重复投递）；JUSTID 明确为「抑制自动刷新、显式 TIME/RETRYCOUNT 仍生效」（Redis 传播形态依赖）。XAUTOCLAIM/XINFO 留后续。
