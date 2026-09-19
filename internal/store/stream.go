@@ -91,6 +91,9 @@ type StreamEntry struct {
 type streamVal struct {
 	entries []StreamEntry // 按 ID 升序
 	last    StreamID      // 迄今最后写入的 ID（XDEL/XTRIM 不回退）
+	// groups 是消费者组状态（Phase 12；nil = 无组）。组的存在改变空流
+	// 生命周期：XDEL/XTRIM 清空后若仍有组则保留空 key（组状态不丢）。
+	groups map[string]*streamGroup
 }
 
 // StreamBound 是 XRANGE 端点：-/+ 无穷、有限 ID、可选 "(" 排他。
@@ -288,8 +291,8 @@ func (s *Store) StreamDel(key string, ids ...StreamID) (int64, error) {
 		}
 	}
 	sv.entries = kept
-	if len(sv.entries) == 0 {
-		delete(s.m, key)
+	if len(sv.entries) == 0 && len(sv.groups) == 0 {
+		delete(s.m, key) // 有消费者组时保留空流（组状态存活，Redis 7 同）
 	}
 	return n, nil
 }
@@ -330,8 +333,8 @@ func (s *Store) StreamTrim(key string, maxLen int64, minID *StreamID) (int64, er
 		}
 	}
 	sv.entries = kept
-	if len(sv.entries) == 0 {
-		delete(s.m, key)
+	if len(sv.entries) == 0 && len(sv.groups) == 0 {
+		delete(s.m, key) // 有消费者组时保留空流（组状态存活，Redis 7 同）
 	}
 	return n, nil
 }

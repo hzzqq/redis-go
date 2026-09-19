@@ -38,6 +38,9 @@ import (
 // callFunc 拒绝（纯读 SORT 放行）。
 var scriptBlocklist = map[string]bool{
 	"BGREWRITEAOF": true, "BLPOP": true, "BRPOP": true, "BRPOPLPUSH": true,
+	// Phase 12：XREADGROUP 的 PEL 效果帧化（读回 PEL 生成 XCLAIM）依赖
+	// canonicalFor 的 applyMu 上下文，脚本效果收集路径未验证，诚实收窄。
+	"XREADGROUP": true,
 }
 
 // oneLine 把错误文本压成单行（RESP 错误行不允许内嵌换行；Lua 编译/运行
@@ -258,7 +261,7 @@ func (ec *evalCtx) callFunc(isCall bool) func(*lua.LState) int {
 		// 成功写命令 → canonical 效果帧（与 AOF/传播同一确定化路径）
 		if isWriteCmd(v) && reply.Type != resp.Error {
 			if c, ok := ec.s.canonicalFor(v, reply, setPre); ok {
-				ec.effects = append(ec.effects, c)
+				ec.effects = append(ec.effects, c...)
 			}
 		}
 		if reply.Type == resp.Error {

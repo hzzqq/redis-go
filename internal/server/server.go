@@ -338,6 +338,13 @@ func (s *Server) applyConn(cl *client, v resp.Value) resp.Value {
 			return s.queueForTxn(cl, cmd, v)
 		}
 		return s.cmdXReadConn(cl, v.Arr[1:])
+	case "XREADGROUP":
+		// MULTI 内排队、EXEC 时非阻塞执行（Redis 同语义）；连接级带 BLOCK
+		// 走阻塞路径（cmdXReadGroupConn 内分流，仅 '>' 可阻塞）
+		if cl.inMulti {
+			return s.queueForTxn(cl, cmd, v)
+		}
+		return s.cmdXReadGroupConn(cl, v)
 	}
 	if cl.inMulti {
 		return s.queueForTxn(cl, cmd, v)
@@ -528,7 +535,9 @@ func (s *Server) apply(v resp.Value) resp.Value {
 	}
 	// 只读副本拒绝写（Redis 同文 READONLY 错误）；主库命令流（applyFromMaster）
 	// 与启动回放不走 apply，因此不受影响。副本仍可 REPLICAOF NO ONE 晋升。
-	if s.isReplica() {
+	// XREADGROUP 豁免：投喂改本地 PEL 但语义是读，副本按读放行（Phase 10
+	// 阻塞命令同款先例）。
+	if s.isReplica() && !isXReadGroup(v) {
 		return readonlyErr()
 	}
 	s.applyMu.Lock()
@@ -538,7 +547,7 @@ func (s *Server) apply(v resp.Value) resp.Value {
 	var frames []resp.Value
 	if reply.Type != resp.Error {
 		if canon, ok := s.canonicalFor(v, reply, setPre); ok {
-			frames = append(frames, canon)
+			frames = append(frames, canon...)
 		}
 		// 写命令提交后触碰 WATCH 了这些 key 的连接（乐观锁 CAS 标记）。
 		// 缺 key 的 DEL 也会触碰（偏保守：只多 abort 不漏 abort）。
@@ -564,12 +573,17 @@ func isSortStore(v resp.Value) bool {
 	return false
 }
 
-// canonicalFor wraps canonicalWrite with the SORT STORE special case: the
+// canonicalFor wraps canonicalWrite with two special cases. SORT STORE: the
 // stored list is persisted as one RPUSH (or DEL for an empty result) built by
 // reading the just-written key back under the caller's applyMu — the SORT
 // command itself is never replayed (it would re-run its random-free but
 // context-dependent computation; the deterministic frame is the stored list).
-func (s *Server) canonicalFor(v, reply resp.Value, setPre bool) (resp.Value, bool) {
+// XREADGROUP (Phase 12): the delivery's PEL effect is persisted as per-entry
+// XCLAIM FORCE JUSTID frames read back from the PEL (the command itself is a
+// read and is never replayed). Returns a frame slice (XREADGROUP serving
+// multiple streams yields one XCLAIM per entry) plus whether anything should
+// be logged.
+func (s *Server) canonicalFor(v, reply resp.Value, setPre bool) ([]resp.Value, bool) {
 	if isSortStore(v) {
 		var dst string
 		for i, a := range v.Arr[1:] {
@@ -579,14 +593,21 @@ func (s *Server) canonicalFor(v, reply resp.Value, setPre bool) (resp.Value, boo
 		}
 		items, err := s.store.ListRange(dst, 0, -1)
 		if err != nil || len(items) == 0 {
-			return respCmd("DEL", dst), true
+			return []resp.Value{respCmd("DEL", dst)}, true
 		}
 		parts := make([]string, 0, 2+len(items))
 		parts = append(parts, "RPUSH", dst)
 		parts = append(parts, items...)
-		return respCmd(parts...), true
+		return []resp.Value{respCmd(parts...)}, true
 	}
-	return canonicalWrite(v, reply, setPre)
+	if isXReadGroup(v) {
+		return s.xreadGroupCanonical(v, reply)
+	}
+	f, ok := canonicalWrite(v, reply, setPre)
+	if !ok {
+		return nil, false
+	}
+	return []resp.Value{f}, true
 }
 
 // isWriteCmd reports whether v dispatches a state-mutating command (the
@@ -619,6 +640,11 @@ var writeCmds = map[string]bool{
 	// Phase 11（stream）：XADD 自动 ID 经 canonicalWrite 定化为显式 ID；
 	// XDEL/XTRIM 本身确定，原样落盘。
 	"XADD": true, "XDEL": true, "XTRIM": true,
+	// Phase 12（消费者组）：XGROUP/XACK/XCLAIM 确定性写命令原样落盘；
+	// XREADGROUP 的 PEL 效果经 canonicalFor 特判帧化为 XCLAIM FORCE JUSTID
+	// （命令本身永不落盘——与 BLPOP 同款「immediate 形态经 canonical 确定化」
+	// 模式，连接级阻塞路径在 applyConn 拦截）。
+	"XGROUP": true, "XACK": true, "XCLAIM": true, "XREADGROUP": true,
 }
 
 // canonicalWrite maps a successful write command to its persisted form.
@@ -1229,6 +1255,17 @@ func (s *Server) dispatch(v resp.Value) resp.Value {
 		// dispatch 只做非阻塞形态（MULTI/EXEC 执行、回放兜底）；连接级
 		// BLOCK 路径在 applyConn 拦截
 		return s.cmdXRead(args)
+	case "XGROUP":
+		return s.cmdXGroup(args)
+	case "XREADGROUP":
+		// dispatch 只做非阻塞形态；连接级 BLOCK 路径在 applyConn 拦截
+		return s.cmdXReadGroupImmediate(args)
+	case "XACK":
+		return s.cmdXack(args)
+	case "XPENDING":
+		return s.cmdXPending(args)
+	case "XCLAIM":
+		return s.cmdXClaim(args)
 	case "REPLICAOF", "SLAVEOF":
 		return s.cmdReplicaOf(args)
 	case "FLUSHALL":

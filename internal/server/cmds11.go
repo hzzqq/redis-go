@@ -454,12 +454,15 @@ func (s *Server) cmdXReadConn(cl *client, args []resp.Value) resp.Value {
 	return s.cmdXReadBlocking(cl, o)
 }
 
-// streamWaiter 是一个阻塞中的 XREAD 等待者（xwMu 串行化 resolved 竞态）。
+// streamWaiter 是一个阻塞中的流等待者（xwMu 串行化 resolved 竞态）。
+// grp 非 nil 时为 Phase 12 的 XREADGROUP '>' 等待者（无需 ids 快照：新条目
+// 即 > 组位点，投喂由组状态自持）。
 type streamWaiter struct {
 	ch   chan struct{} // resolved 时 close
 	keys []string      // 注册过的 key（去重，注销用）
 	ids  map[string]store.StreamID
 	o    xreadOpts
+	grp  *xreadGroupOpts // 非 nil = XREADGROUP 等待者
 
 	served, aborted bool
 	reply           resp.Value // served 时由投喂方填充
@@ -533,15 +536,17 @@ func (s *Server) cmdXReadBlocking(cl *client, o xreadOpts) resp.Value {
 	return resp.Value{Type: resp.Array, Null: true} // 超时（探针断连时写入失败即退出）
 }
 
-// serveStreamWaiters 扫描已提交的 canonical 帧中的 XADD，唤醒等待这些流且
-// 已有新条目（ID > 快照 ID）的等待者。流的读是非消费型：同一批新条目可以
-// 喂给所有等待者（与 BLPOP 的 FIFO 单消费不同），每人独立构建全量快照
-// 回复（含其请求的全部流的新数据）。由 logAndPropagate 调用（applyMu 内）。
-func (s *Server) serveStreamWaiters(frames []resp.Value) {
+// serveStreamWaiters 扫描已提交的 canonical 帧中的 XADD，唤醒等待这些流的
+// 等待者。XREAD 等待者（grp==nil）是纯读快照：同一批新条目喂给所有等待者，
+// 每人独立构建全量快照回复，不产生帧。XREADGROUP '>' 等待者（grp!=nil）是
+// 单消费投喂：同组先到先得（先投喂者拿走新条目并推进 lastDelivered，后者
+// 保持阻塞），不同组各有独立位点；投喂产生的 XCLAIM FORCE JUSTID 帧返回给
+// 调用方并入本批帧落盘/传播。由 logAndPropagate 调用（applyMu 内）。
+func (s *Server) serveStreamWaiters(frames []resp.Value) []resp.Value {
 	s.xwMu.Lock()
 	defer s.xwMu.Unlock()
 	if len(s.xblockQ) == 0 {
-		return
+		return nil
 	}
 	var pushed []string
 	for _, f := range frames {
@@ -553,9 +558,14 @@ func (s *Server) serveStreamWaiters(frames []resp.Value) {
 			pushed = append(pushed, k)
 		}
 	}
+	var out []resp.Value
 	for _, key := range pushed {
 		for _, w := range s.xblockQ[key] {
 			if w.served || w.aborted {
+				continue
+			}
+			if w.grp != nil {
+				out = append(out, s.feedStreamGroupWaiterLocked(w)...)
 				continue
 			}
 			fresh, _, err := s.store.StreamRead(key, w.ids[key], 1)
@@ -580,6 +590,58 @@ func (s *Server) serveStreamWaiters(frames []resp.Value) {
 		}
 		s.compactStreamQueueLocked(key)
 	}
+	return out
+}
+
+// feedStreamGroupWaiterLocked 尝试为 XREADGROUP '>' 等待者投喂（caller
+// holds xwMu，且处于 XADD 提交的 applyMu 临界区内）：按请求序对各 key 执行
+// '>' 取数（首 key 有数据即成行，全部空则保持阻塞）；store 错误（如组被
+// DESTROY）以错误回复终结等待。非 NOACK 投喂逐流帧化 XCLAIM（读回精确
+// PEL 状态）并触碰 WATCH。
+func (s *Server) feedStreamGroupWaiterLocked(w *streamWaiter) []resp.Value {
+	o := w.grp
+	rows := make([]resp.Value, 0, len(o.keys))
+	type fedStream struct {
+		key string
+		ids []store.StreamID
+	}
+	var fed []fedStream
+	for _, k := range o.keys {
+		entries, exists, err := s.store.StreamReadGroupNew(k, o.group, o.consumer, o.count, o.noack)
+		if err != nil {
+			// 组被销毁/类型变化：错误回复终结等待（Redis 语义近似）
+			w.reply = errReply(err)
+			w.served = true
+			close(w.ch)
+			return nil
+		}
+		if !exists || len(entries) == 0 {
+			continue
+		}
+		rows = append(rows, streamRow(k, entries))
+		fs := fedStream{key: k, ids: make([]store.StreamID, 0, len(entries))}
+		for _, en := range entries {
+			fs.ids = append(fs.ids, en.ID)
+		}
+		fed = append(fed, fs)
+	}
+	if len(rows) == 0 {
+		return nil // 无新数据：保持阻塞，下次 XADD 再唤醒
+	}
+	w.reply = resp.Value{Type: resp.Array, Arr: rows}
+	w.served = true
+	close(w.ch)
+	// 非 NOACK：逐流 XCLAIM 帧；NOACK：无 PEL 变化（读回为空，XCLAIM 自然
+	// 缺席）——但 '>' 位点推进对两者都必须以 XGROUP SETID 帧落盘/传播。
+	var out []resp.Value
+	for _, fs := range fed {
+		frames := s.xreadGroupFrames(fs.key, o.group, o.consumer, fs.ids, true)
+		out = append(out, frames...)
+	}
+	for _, f := range out {
+		s.touchWatched(f, nil)
+	}
+	return out
 }
 
 // compactStreamQueueLocked 清掉已解决的等待者（caller holds xwMu）。

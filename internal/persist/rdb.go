@@ -127,7 +127,12 @@ func appendRecord(buf []byte, e store.Exported) ([]byte, error) {
 	case "zset":
 		kind = 4
 	case "stream":
+		// kind 6 = stream + 消费者组（Phase 12）；kind 5 保留给无组流，
+		// 旧文件兼容性不受影响。
 		kind = 5
+		if len(e.Groups) > 0 {
+			kind = 6
+		}
 	default:
 		return nil, fmt.Errorf("rdb: unknown kind %q", e.Kind)
 	}
@@ -174,6 +179,29 @@ func appendRecord(buf []byte, e store.Exported) ([]byte, error) {
 			buf = appendUint32(buf, uint32(len(en.Fields)))
 			for _, s := range en.Fields {
 				buf = appendString(buf, s)
+			}
+		}
+		// kind 6 追加消费者组段：组数 × {名字, lastDelivered ms/seq,
+		// 消费者数 × 名字, PEL 数 × {ms, seq, 消费者, 投递毫秒, 计数}}。
+		// 导出侧已按名字/ID 排序，字节级确定。
+		if len(e.Groups) > 0 {
+			buf = appendUint32(buf, uint32(len(e.Groups)))
+			for _, gs := range e.Groups {
+				buf = appendString(buf, gs.Name)
+				buf = appendUint64(buf, gs.LastDelivered.MS)
+				buf = appendUint64(buf, gs.LastDelivered.Seq)
+				buf = appendUint32(buf, uint32(len(gs.Consumers)))
+				for _, c := range gs.Consumers {
+					buf = appendString(buf, c)
+				}
+				buf = appendUint32(buf, uint32(len(gs.Pel)))
+				for _, ps := range gs.Pel {
+					buf = appendUint64(buf, ps.ID.MS)
+					buf = appendUint64(buf, ps.ID.Seq)
+					buf = appendString(buf, ps.Consumer)
+					buf = appendUint64(buf, uint64(ps.DeliveryMS))
+					buf = appendUint32(buf, uint32(ps.Count))
+				}
 			}
 		}
 	}
@@ -276,6 +304,8 @@ func decodeRecord(buf []byte) (store.Exported, []byte, error) {
 		e.Kind = "zset"
 	case 5:
 		e.Kind = "stream"
+	case 6:
+		e.Kind = "stream" // stream + 消费者组（Phase 12）
 	default:
 		return store.Exported{}, nil, fmt.Errorf("rdb: unknown kind byte %d", kind)
 	}
@@ -396,6 +426,78 @@ func decodeRecord(buf []byte) (store.Exported, []byte, error) {
 				en.Fields = append(en.Fields, s)
 			}
 			e.Stream = append(e.Stream, en)
+		}
+		// kind 6：消费者组段（与编码序一一对应）
+		if kind == 6 {
+			var ng uint32
+			ng, buf, err = readUint32(buf)
+			if err != nil {
+				return store.Exported{}, nil, err
+			}
+			for i := uint32(0); i < ng; i++ {
+				var gs store.GroupState
+				gs.Name, buf, err = readString(buf)
+				if err != nil {
+					return store.Exported{}, nil, err
+				}
+				var lms, lseq uint64
+				lms, buf, err = readUint64(buf)
+				if err != nil {
+					return store.Exported{}, nil, err
+				}
+				lseq, buf, err = readUint64(buf)
+				if err != nil {
+					return store.Exported{}, nil, err
+				}
+				gs.LastDelivered = store.StreamID{MS: lms, Seq: lseq}
+				var nc uint32
+				nc, buf, err = readUint32(buf)
+				if err != nil {
+					return store.Exported{}, nil, err
+				}
+				for j := uint32(0); j < nc; j++ {
+					var c string
+					c, buf, err = readString(buf)
+					if err != nil {
+						return store.Exported{}, nil, err
+					}
+					gs.Consumers = append(gs.Consumers, c)
+				}
+				var np uint32
+				np, buf, err = readUint32(buf)
+				if err != nil {
+					return store.Exported{}, nil, err
+				}
+				for j := uint32(0); j < np; j++ {
+					var ms, seq, dms uint64
+					var consumer string
+					var cnt uint32
+					ms, buf, err = readUint64(buf)
+					if err != nil {
+						return store.Exported{}, nil, err
+					}
+					seq, buf, err = readUint64(buf)
+					if err != nil {
+						return store.Exported{}, nil, err
+					}
+					consumer, buf, err = readString(buf)
+					if err != nil {
+						return store.Exported{}, nil, err
+					}
+					dms, buf, err = readUint64(buf)
+					if err != nil {
+						return store.Exported{}, nil, err
+					}
+					cnt, buf, err = readUint32(buf)
+					if err != nil {
+						return store.Exported{}, nil, err
+					}
+					gs.Pel = append(gs.Pel, store.PelState{
+						ID:       store.StreamID{MS: ms, Seq: seq},
+						Consumer: consumer, DeliveryMS: int64(dms), Count: int64(cnt)})
+				}
+				e.Groups = append(e.Groups, gs)
+			}
 		}
 	}
 	if err != nil {

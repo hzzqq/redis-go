@@ -63,8 +63,11 @@ var cmdArity = map[string][2]int{
 	// Phase 10
 	"BLPOP": {2, -1}, "BRPOP": {2, -1}, "BRPOPLPUSH": {3, 3}, "SORT": {1, -1},
 	// Phase 11（stream）
-	"XADD": {4, -1}, "XLEN": {1, 1}, "XRANGE": {3, 3}, "XREVRANGE": {3, 3},
+	"XADD": {4, -1}, "XLEN": {1, 1}, "XRANGE": {3, 5}, "XREVRANGE": {3, 5},
 	"XDEL": {2, -1}, "XTRIM": {3, -1}, "XREAD": {3, -1},
+	// Phase 12（消费者组）
+	"XGROUP": {3, -1}, "XREADGROUP": {6, -1}, "XACK": {3, -1},
+	"XPENDING": {2, -1}, "XCLAIM": {5, -1},
 }
 
 // resetTxn clears the connection's transaction state.
@@ -135,16 +138,17 @@ func (s *Server) execTransaction(cl *client) resp.Value {
 			scriptEffects = append(scriptEffects, eff...)
 			continue
 		}
-		// 副本上阻塞弹出是读（MULTI 内 EXEC 非阻塞执行，Redis 同语义），
-		// 不走 READONLY 门；其余写命令照旧拒绝
-		if s.isReplica() && isWriteCmd(q) && !isBlockingCmd(mustFirstCmd(q)) {
+		// 副本上阻塞弹出与 XREADGROUP 是读（MULTI 内 EXEC 非阻塞执行，
+		// Redis 同语义），不走 READONLY 门；其余写命令照旧拒绝
+		if s.isReplica() && isWriteCmd(q) &&
+			!isBlockingCmd(mustFirstCmd(q)) && !isXReadGroup(q) {
 			r = readonlyErr()
 		} else {
 			pre := s.setPreState(q)
 			r = s.dispatch(q)
 			if isWriteCmd(q) && r.Type != resp.Error {
 				if c, ok := s.canonicalFor(q, r, pre); ok {
-					canon = append(canon, c)
+					canon = append(canon, c...)
 				}
 			}
 		}
@@ -238,6 +242,9 @@ func (s *Server) applyExported(en store.Exported) {
 		}
 	case "stream":
 		s.store.StreamRestore(en.Key, en.Stream)
+		if len(en.Groups) > 0 {
+			s.store.StreamRestoreGroups(en.Key, en.Groups) // RDB kind6 消费者组
+		}
 		if !en.Expiry.IsZero() {
 			s.store.ExpireAt(en.Key, en.Expiry)
 		}

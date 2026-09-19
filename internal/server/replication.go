@@ -495,7 +495,7 @@ func (s *Server) applyFromMaster(v resp.Value) {
 	var frames []resp.Value
 	if reply.Type != resp.Error {
 		if canon, ok := s.canonicalFor(v, reply, setPre); ok {
-			frames = append(frames, canon)
+			frames = append(frames, canon...)
 		}
 	}
 	s.logAndPropagate(frames)
@@ -512,7 +512,7 @@ func (s *Server) applyMasterBlock(block []resp.Value) {
 		reply := s.dispatch(q)
 		if isWriteCmd(q) && reply.Type != resp.Error {
 			if canon, ok := s.canonicalFor(q, reply, setPre); ok {
-				frames = append(frames, canon)
+				frames = append(frames, canon...)
 			}
 		}
 	}
@@ -740,9 +740,12 @@ func (s *Server) logAndPropagate(frames []resp.Value) error {
 	if extra := s.serveWaitersFrames(frames); len(extra) > 0 {
 		frames = append(append([]resp.Value{}, frames...), extra...)
 	}
-	// Phase 11：流等待者投喂（XREAD BLOCK）。纯读快照、不产生确定性帧，
-	// 必须在 XADD 提交的同一 applyMu 临界区内完成（与注册路径成对消除空窗）。
-	s.serveStreamWaiters(frames)
+	// Phase 11/12：流等待者投喂（XREAD BLOCK 纯读无帧；XREADGROUP '>' 投喂
+	// 产生 XCLAIM FORCE JUSTID 帧，与 XADD 提交在同一 applyMu 临界区内完成，
+	// 与注册路径成对消除空窗）。
+	if extra := s.serveStreamWaiters(frames); len(extra) > 0 {
+		frames = append(append([]resp.Value{}, frames...), extra...)
+	}
 	var firstErr error
 	for _, f := range frames {
 		if s.aof != nil && firstErr == nil {

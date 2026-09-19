@@ -572,6 +572,27 @@ func (s *Store) Snapshot() [][]string {
 				cmd = append(cmd, en.Fields...)
 				out = append(out, cmd)
 			}
+			// 消费者组重建（Phase 12）：先建组（MKSTREAM 对空流+组场景必需，
+			// 对已存在的流无害），再逐条 XCLAIM FORCE JUSTID 恢复 PEL（TIME/
+			// RETRYCOUNT 精确定格投递状态；条目已被 XDEL/XTRIM 清掉的幽灵
+			// PEL 无法保留——XCLAIM 重放侧会跳过，诚实取舍），最后补建空
+			// PEL 的消费者（CREATECONSUMER 幂等）。
+			for _, gs := range streamGroupsSorted(v) {
+				out = append(out, []string{"XGROUP", "CREATE", k, gs.Name,
+					gs.LastDelivered.String(), "MKSTREAM"})
+				inPel := map[string]bool{}
+				for _, ps := range gs.Pel {
+					inPel[ps.Consumer] = true
+					out = append(out, []string{"XCLAIM", k, gs.Name, ps.Consumer, "0",
+						ps.ID.String(), "TIME", strconv.FormatInt(ps.DeliveryMS, 10),
+						"RETRYCOUNT", strconv.FormatInt(ps.Count, 10), "FORCE", "JUSTID"})
+				}
+				for _, c := range gs.Consumers {
+					if !inPel[c] {
+						out = append(out, []string{"XGROUP", "CREATECONSUMER", k, gs.Name, c})
+					}
+				}
+			}
 		}
 	}
 	return out
@@ -1459,6 +1480,7 @@ type Exported struct {
 	Set    []string // sorted for deterministic output
 	ZItems []ZItem  // skip-list order (score asc, member asc)
 	Stream []StreamEntry
+	Groups []GroupState // stream 消费者组（Phase 12；组名字典序）
 }
 
 // Export returns every live key as a typed snapshot for RDB saving (expired
@@ -1500,6 +1522,9 @@ func (s *Store) Export() []Exported {
 		case *streamVal:
 			en.Kind = "stream"
 			en.Stream = append([]StreamEntry(nil), v.entries...)
+			// 组状态内联导出（已持 RLock，不可调 StreamGroups——RWMutex
+			// 重入在写者等待时会死锁），复用确定性排序 helper。
+			en.Groups = streamGroupsSorted(v)
 		}
 		out = append(out, en)
 	}

@@ -14,6 +14,8 @@
 package server
 
 import (
+	"strings"
+
 	"github.com/hzzqq/redis-go/internal/resp"
 )
 
@@ -116,6 +118,19 @@ func writeCmdKeys(name string, args []resp.Value) []string {
 	case "LMOVE": // 改动源和目标两个 key（args 不含命令名：src dst dir dir）
 		if len(args) >= 2 {
 			return []string{args[0].Str, args[1].Str}
+		}
+		return nil
+	case "XREADGROUP": // keys 在 STREAMS 之后的前半段（args 不含命令名）
+		for i, a := range args {
+			if strings.EqualFold(a.Str, "STREAMS") {
+				rest := args[i+1:]
+				half := len(rest) / 2
+				keys := make([]string, 0, half)
+				for _, k := range rest[:half] {
+					keys = append(keys, k.Str)
+				}
+				return keys
+			}
 		}
 		return nil
 	case "DEL", "MGET":
