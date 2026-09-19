@@ -24,6 +24,28 @@ func TestRDBRoundtrip(t *testing.T) {
 		{Key: "z", Kind: "zset", ZItems: []store.ZItem{{Member: "bob", Score: 8}, {Member: "alice", Score: 10.5}}},
 		{Key: "bin", Kind: "string", Str: "\x00\xff中文\r\n"},
 		{Key: "big", Kind: "set", Set: bigMembers(17000)}, // 跨过小长度编码边界
+		// kind 6：stream + 消费者组（PEL 含多消费者、多投递计数）
+		{Key: "grp", Kind: "stream",
+			Stream: []store.StreamEntry{
+				{ID: store.StreamID{MS: 1, Seq: 0}, Fields: []string{"f", "a"}},
+				{ID: store.StreamID{MS: 2, Seq: 0}, Fields: []string{"f", "b"}},
+			},
+			Groups: []store.GroupState{{
+				Name:          "g1",
+				LastDelivered: store.StreamID{MS: 2, Seq: 0},
+				Consumers:     []string{"alice", "bob"},
+				Pel: []store.PelState{
+					{ID: store.StreamID{MS: 1, Seq: 0}, Consumer: "alice",
+						DeliveryMS: 1111, Count: 2},
+					{ID: store.StreamID{MS: 2, Seq: 0}, Consumer: "bob",
+						DeliveryMS: 2222, Count: 1},
+				},
+			}, {
+				Name:          "g2",
+				LastDelivered: store.StreamID{MS: 1, Seq: 0},
+				Consumers:     []string{"solo"},
+			}},
+		},
 	}
 	if err := SaveRDB(path, keys); err != nil {
 		t.Fatal(err)
